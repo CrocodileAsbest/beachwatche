@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-“””
+"""
 beachplatz_watcher.py
 
 Polls the StuRa HTW Dresden beach court booking system and notifies via
@@ -17,7 +17,7 @@ Designed to run on GitHub Actions on a cron schedule. State is read from
 and written to ./state/beachplatz_state.json, which is restored/saved by
 the Actions cache between runs. Notifications go via Telegram using the
 secrets TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.
-“””
+"""
 
 from **future** import annotations
 
