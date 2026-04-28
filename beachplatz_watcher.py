@@ -44,19 +44,19 @@ BASE_URL = "https://tix.htw.stura-dresden.de/beachplatz/buchung-beachplatz/"
 # Bookings open about 4 weeks in advance ("Buchung 4 Wochen vorher möglich").
 # We watch the week(s) at this offset relative to the current ISO week.
 # Default: just +4. Use e.g. range(3, 6) to also watch +3 and +5 defensively.
-WEEK_OFFSETS = [4]
+WEEK_OFFSETS = [3]
 
 # The product line that signals "open for me".
 # Change to "Student:in weiterer Hochschule" if that's your category.
 OPEN_MARKER = "Mitglied Student:innenschaft HTWD"
 
 # Optional filters. Leave empty to match everything in the watched weeks.
-WEEKDAYS_FILTER: list[str] = []        # e.g. ["Sa", "So"]
+WEEKDAYS_FILTER: list[str] = ["Mo","Di","Mi","Do","Fr"]        # e.g. ["Sa", "So"]
 TIME_SLOTS_FILTER: list[str] = []      # e.g. ["18:30", "20:00"]
 FIELDS_FILTER: list[str] = []          # e.g. ["Feld 1"]
 
 # Polite delay between per-slot fetches (seconds, randomised)
-REQUEST_DELAY_RANGE = (1.0, 2.5)
+REQUEST_DELAY_RANGE = (0.3, 0.5)
 
 # Paths
 SCRIPT_DIR = Path(__file__).resolve().parent
