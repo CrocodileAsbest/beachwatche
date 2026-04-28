@@ -82,8 +82,8 @@ log = logging.getLogger("beachplatz")
 # ---------------------------------------------------------------------------
 
 def notify_telegram(title: str, body: str) -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    token = os.environ.get("8796334288:AAETbsnOFdSh7183Bf0wnpSWtaYchBx7VQM")
+    chat_id = os.environ.get("-1003936280421")
     if not token or not chat_id:
         log.warning("Telegram credentials missing; printing instead")
         print(f"\n{title}\n{'-'*len(title)}\n{body}\n")
