@@ -50,7 +50,7 @@ BASE_URL = “https://tix.htw.stura-dresden.de/beachplatz/buchung-beachplatz/”
 
 # Default: just +4. Use e.g. range(3, 6) to also watch +3 and +5 defensively.
 
-WEEK_OFFSETS = [4]
+WEEK_OFFSETS =range(3,6)
 
 # The product line that signals “open for me”.
 
