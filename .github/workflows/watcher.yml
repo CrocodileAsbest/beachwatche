@@ -2,7 +2,7 @@ name: Beachplatz Watcher
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:  # allow manual runs from the Actions tab
 
 # Prevent two runs from overlapping if a previous one is slow.
