@@ -1,5 +1,6 @@
 # Beachplatz Watcher
 
+
 Polls the StuRa HTW Dresden beach court booking page and sends a Telegram
 notification when previously-closed slots become bookable.
 
