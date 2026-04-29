@@ -45,7 +45,7 @@ BASE_URL = "https://tix.htw.stura-dresden.de/beachplatz/buchung-beachplatz/"
 # Bookings open about 4 weeks in advance ("Buchung 4 Wochen vorher möglich").
 # We watch the week(s) at this offset relative to the current ISO week.
 # Default: just +4. Use e.g. range(3, 6) to also watch +3 and +5 defensively.
-WEEK_OFFSETS = [4]
+WEEK_OFFSETS = [3]
 
 # The product line that signals "open for me".
 # Change to "Student:in weiterer Hochschule" if that's your category.
