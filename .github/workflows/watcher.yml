@@ -2,8 +2,7 @@ name: Beachplatz Watcher
 
 on:
   schedule:
-    # Every 10 minutes. Note: GitHub may delay scheduled runs at peak times.
-    - cron: '*/10 * * * *'
+    - cron: '*/10 13-22 * * 1-5'
   workflow_dispatch:  # allow manual runs from the Actions tab
 
 # Prevent two runs from overlapping if a previous one is slow.
