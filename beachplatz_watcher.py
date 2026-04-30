@@ -63,8 +63,8 @@ AUTO_HOLD_ENABLED = True
 # Empty list = never auto-hold (notify-only mode).
 PREFERRED_SLOTS: list[tuple[str, str, str]] = [
     (weekday, time, field)
-    for weekday in ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")
-    for time in ("17:00", "18:30")
+    for weekday in ("Mo", "Di", "Mi", "Do", "Fr")
+    for time in ("17:00", "18:30","20:00)
     for field in ("Feld 1", "Feld 2")
 ]
 
