@@ -56,7 +56,7 @@ STRIKE_DURATION_SECONDS = 130
 
 # Polling interval per target slot, in milliseconds. Each target has its
 # own thread, so this is per-slot, not aggregate.
-POLL_INTERVAL_MS = 200
+POLL_INTERVAL_MS = 80
 
 logging.basicConfig(
     level=logging.INFO,
