@@ -20,10 +20,12 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -44,6 +46,7 @@ from beachplatz_watcher import (  # noqa: E402
     todays_weekday_abbr,
     weeks_to_watch,
 )
+from book import complete_booking  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Strike-specific config
@@ -56,7 +59,21 @@ STRIKE_DURATION_SECONDS = 130
 
 # Polling interval per target slot, in milliseconds. Each target has its
 # own thread, so this is per-slot, not aggregate.
-POLL_INTERVAL_MS = 80
+POLL_INTERVAL_MS = 100
+
+# Hours (Berlin time) at which slots actually open. Script triggers ~90s
+# early via systemd; after pre-warming, it sleeps until the next of these
+# moments before starting the polling loop. This guarantees polling starts
+# AT release time, not whenever pre-warm finishes.
+STRIKE_HOURS = (17, 20)
+
+# Maximum bookings the bot may create per calendar day. Counted via the
+# state file's "booking_log" entry.
+DAILY_BOOKING_LIMIT = 2
+
+# Weekdays the bot will NOT strike on (in addition to weekend exclusion
+# handled by the systemd timer). Fridays are reserved for non-bot users.
+EXCLUDED_WEEKDAYS = {"Fr"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -201,7 +218,7 @@ def fire_cart_add(target: Target, voucher: str) -> dict | None:
 
 
 def poll_target(target: Target, deadline: float, voucher: str,
-                stop_signal: dict) -> dict | None:
+                stop_signal: dict, hold_lock) -> dict | None:
     """
     Loop polling a single target until either:
     - the slot opens (then fire cart-add and return result)
@@ -210,11 +227,15 @@ def poll_target(target: Target, deadline: float, voucher: str,
 
     Each poll is a GET on the slot URL using the pre-warmed session,
     so connections stay alive via HTTP keep-alive.
+
+    The hold_lock + stop_signal pair enforces the single-slot rule:
+    only one thread can be inside the cart-add critical section at a
+    time, and that thread re-checks stop_signal *while holding the lock*
+    so a second thread can't race past.
     """
     poll_interval = POLL_INTERVAL_MS / 1000.0
     sid = target.slot["slot_id"]
     rounds = 0
-    saw_open_at = None
 
     while time.time() < deadline:
         if stop_signal.get("held"):
@@ -230,19 +251,25 @@ def poll_target(target: Target, deadline: float, voucher: str,
             continue
 
         if r.status_code == 200 and OPEN_MARKER in r.text:
-            saw_open_at = time.time()
             log.info("OPEN DETECTED %s after %d rounds", sid, rounds)
-            # Fire immediately. Don't release the GIL/sleep.
-            hold = fire_cart_add(target, voucher)
-            if hold:
-                stop_signal["held"] = True
-                return hold
-            else:
-                # Failed to grab even though it appeared open. Other bot
-                # likely won the cart-add race or pretix rejected. Stop
-                # trying this slot to avoid pointless POST spam.
-                log.warning("Saw %s open but cart-add failed; abandoning",
-                            sid)
+
+            # Critical section: serialize cart-add attempts. Re-check
+            # stop_signal *inside* the lock so a thread that's been
+            # waiting on the lock can't fire after another already won.
+            with hold_lock:
+                if stop_signal.get("held"):
+                    log.info("Another thread already won; aborting %s", sid)
+                    return None
+                hold = fire_cart_add(target, voucher)
+                if hold:
+                    stop_signal["held"] = True
+                    # Return both the hold dict AND the target, so the
+                    # caller can use the target's session to complete
+                    # checkout.
+                    return {"hold": hold, "target": target}
+                else:
+                    log.warning("Saw %s open but cart-add failed; abandoning",
+                                sid)
                 return None
 
         elapsed = time.time() - round_start
@@ -255,31 +282,108 @@ def poll_target(target: Target, deadline: float, voucher: str,
 
 
 # ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
+
+BERLIN_TZ = ZoneInfo("Europe/Berlin")
+
+
+def next_strike_time() -> datetime:
+    """
+    Returns the next datetime (in UTC) at which a strike-hour boundary
+    occurs in Berlin time. Used to align the polling start with the
+    actual slot release moment.
+    """
+    now_berlin = datetime.now(BERLIN_TZ)
+    candidates = []
+    for hour in STRIKE_HOURS:
+        # Today at HH:00:00 Berlin
+        candidate = now_berlin.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if candidate <= now_berlin:
+            candidate += timedelta(days=1)
+        candidates.append(candidate)
+    return min(candidates).astimezone(ZoneInfo("UTC"))
+
+
+def sleep_until_strike_time() -> None:
+    """
+    Sleep until the next 17:00 or 20:00 Berlin time, whichever comes first.
+    Caps wait at 5 minutes -- if we're somehow more than 5 minutes early
+    we proceed immediately rather than block forever.
+    """
+    target_utc = next_strike_time()
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    wait_seconds = (target_utc - now_utc).total_seconds()
+
+    if wait_seconds <= 0:
+        log.info("Strike time already passed (%.2fs late). Polling now.",
+                 -wait_seconds)
+        return
+    if wait_seconds > 300:
+        log.warning("Strike time is %.0fs away (>5min). Polling now anyway.",
+                    wait_seconds)
+        return
+
+    log.info("Pre-warm complete. Sleeping %.2fs until strike time %s",
+             wait_seconds, target_utc.astimezone(BERLIN_TZ).isoformat(timespec="seconds"))
+    time.sleep(wait_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Booking limit helpers
+# ---------------------------------------------------------------------------
+
+def bookings_today(state: dict) -> int:
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_entries = state.get("booking_log", [])
+    return sum(1 for e in log_entries if e.get("booked_at", "").startswith(today))
+
+
+def record_booking(state: dict, booking: dict) -> None:
+    """Append a successful booking to the persistent log."""
+    log_entries = state.setdefault("booking_log", [])
+    log_entries.append(booking)
+    # Trim log to last 50 entries to keep file size bounded
+    if len(log_entries) > 50:
+        state["booking_log"] = log_entries[-50:]
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def strike() -> int:
     voucher = os.environ.get("STURA_VOUCHER")
+    email = os.environ.get("BOOKING_EMAIL")
     if not voucher:
         log.error("STURA_VOUCHER not set; cannot strike")
         return 1
+    if not email:
+        log.error("BOOKING_EMAIL not set; cannot complete booking")
+        return 1
 
-    state = load_state()
-    if has_active_hold(state):
-        log.info("Active hold present from earlier; skipping strike")
+    today_abbr = todays_weekday_abbr()
+    if today_abbr in EXCLUDED_WEEKDAYS:
+        log.info("Today (%s) is in EXCLUDED_WEEKDAYS; skipping strike",
+                 today_abbr)
         return 0
 
-    # Discover targets via shared session (one-shot, can be ephemeral).
+    state = load_state()
+
+    # Hard daily-limit gate.
+    booked_today = bookings_today(state)
+    if booked_today >= DAILY_BOOKING_LIMIT:
+        log.info("Daily booking limit (%d) already reached; skipping strike",
+                 DAILY_BOOKING_LIMIT)
+        return 0
+
+    # Discover targets.
     discover_session = make_session()
     target_slots = discover_target_slots(discover_session)
     if not target_slots:
         log.info("No target slots to strike for; exiting")
         return 0
 
-    # Pre-warm one persistent session per target. This gives us:
-    # - cookies (pretix_session, csrftoken) ready to go
-    # - HTTP connection kept alive for fast polling
-    # - cart-add URL pre-built
     log.info("Pre-warming %d target session(s)...", len(target_slots))
     targets: list[Target] = []
     for s in target_slots:
@@ -293,46 +397,81 @@ def strike() -> int:
         log.error("No targets could be warmed; exiting")
         return 0
 
-    log.info("Pre-warm complete. Polling for %ds, %dms per cycle.",
-             STRIKE_DURATION_SECONDS, POLL_INTERVAL_MS)
+    # Sleep until the next strike-hour boundary in Berlin time. We were
+    # triggered ~90s early by systemd; pre-warm consumes some of that
+    # margin; whatever's left, we wait so polling starts AT release time.
+    sleep_until_strike_time()
+
+    log.info("Strike time reached. Polling for %ds, %dms per cycle. "
+             "Bookings used today: %d/%d.",
+             STRIKE_DURATION_SECONDS, POLL_INTERVAL_MS,
+             booked_today, DAILY_BOOKING_LIMIT)
 
     deadline = time.time() + STRIKE_DURATION_SECONDS
     stop_signal: dict = {"held": False}
-    held_slot = None
+    hold_lock = threading.Lock()
+    winner = None
 
-    # One thread per target. Each polls its assigned slot independently.
     with ThreadPoolExecutor(max_workers=len(targets)) as pool:
         futures = [
-            pool.submit(poll_target, t, deadline, voucher, stop_signal)
+            pool.submit(poll_target, t, deadline, voucher, stop_signal, hold_lock)
             for t in targets
         ]
         for fut in as_completed(futures):
             result = fut.result()
             if result:
-                held_slot = result
-                # stop_signal was already set by the winning thread; other
-                # threads will exit on their next iteration.
+                winner = result
                 break
 
-    if held_slot:
-        title = f"🛒 STRIKE: {held_slot['description']}"
-        body = (
-            f"Auto-held in cart. Complete checkout within 5 minutes:\n"
-            f"{held_slot['cart_url']}\n\n"
-            f"Hold expires: {held_slot['held_until']}"
+    if not winner:
+        log.info("Strike ended with no hold")
+        notify_telegram(
+            "⚠️ Strike: no slots held",
+            "Polling completed but no slot was successfully held.",
         )
-        notify_telegram(title, body)
-        state["active_hold"] = held_slot
-        state["last_run"] = datetime.now().isoformat(timespec="seconds")
-        save_state(state)
         return 0
 
-    log.info("Strike ended with no hold")
-    notify_telegram(
-        "⚠️ Strike: no slots held",
-        "Polling completed but no slot was successfully held. "
-        "Either no release happened, or the other bot was faster.",
+    held_slot = winner["hold"]
+    target = winner["target"]
+    log.info("Held slot %s. Proceeding to complete booking...",
+             held_slot["slot_id"])
+
+    # Complete the booking using the same session that did the cart-add.
+    order_url = complete_booking(target.session, email)
+
+    if not order_url:
+        log.error("Cart-add succeeded but booking completion failed for %s",
+                  held_slot["slot_id"])
+        notify_telegram(
+            "⚠️ Booking incomplete",
+            f"Held {held_slot['description']} but checkout failed. "
+            f"Slot will release in 5 minutes.\n\n"
+            f"Cart URL (try in browser ASAP):\n{held_slot['cart_url']}",
+        )
+        return 0
+
+    # Success.
+    booking_record = {
+        "slot_id": held_slot["slot_id"],
+        "description": held_slot["description"],
+        "slot_url": held_slot["slot_url"],
+        "order_url": order_url,
+        "booked_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    record_booking(state, booking_record)
+    state["last_run"] = datetime.now().isoformat(timespec="seconds")
+    # Don't keep "active_hold" — the booking is done, hold is moot.
+    state.pop("active_hold", None)
+    save_state(state)
+
+    title = f"✅ BOOKED: {held_slot['description']}"
+    body = (
+        f"Booking confirmed and paid (€0 with voucher).\n\n"
+        f"Order details / cancel link:\n{order_url}\n\n"
+        f"Who's coming? Reply in this channel.\n"
+        f"Slot used today: {booked_today + 1}/{DAILY_BOOKING_LIMIT}."
     )
+    notify_telegram(title, body)
     return 0
 
 
