@@ -39,7 +39,7 @@ def book_slot(slot_id: str, voucher: str, email: str, headless: bool = True) -> 
 
             # 1. Navigate to slot detail
             slot_url = f"{BASE_URL}{slot_id}/"
-            print(f"[1] GET {slot_url}")
+            print(f"[1b] GET {slot_url}")
             page.goto(slot_url, wait_until="domcontentloaded", timeout=15000)
 
             # 2. Enter voucher and redeem
