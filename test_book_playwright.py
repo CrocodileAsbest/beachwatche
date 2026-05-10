@@ -37,6 +37,10 @@ def book_slot(slot_id: str, voucher: str, email: str, headless: bool = True) -> 
             )
             page = context.new_page()
 
+                        # 1. Visit the main booking listing first to establish session
+            print(f"[1a] GET {BASE_URL}")
+            page.goto(BASE_URL, wait_until="domcontentloaded", timeout=15000)
+            
             # 1. Navigate to slot detail
             slot_url = f"{BASE_URL}{slot_id}/"
             print(f"[1b] GET {slot_url}")
