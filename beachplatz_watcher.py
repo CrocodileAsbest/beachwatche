@@ -230,7 +230,10 @@ GERMAN_WEEKDAY_ABBR = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 
 
 def todays_weekday_abbr(now: datetime | None = None) -> str:
-    return GERMAN_WEEKDAY_ABBR[(now or datetime.now()).weekday()]
+    from zoneinfo import ZoneInfo
+    if now is None:
+        now = datetime.now(ZoneInfo("Europe/Berlin"))
+    return GERMAN_WEEKDAY_ABBR[now.weekday()]
 
 
 def slot_matches_filters(slot: dict) -> bool:
