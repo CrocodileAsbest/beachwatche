@@ -77,7 +77,7 @@ POLL_DURATION_SECONDS = 60
 
 # Polling interval per browser, in milliseconds. Each target browser polls
 # its own cart-add button independently.
-POLL_INTERVAL_MS = 500
+POLL_INTERVAL_MS = 400
 
 # Per-browser User-Agent so Chromium looks like normal Chrome.
 BROWSER_UA = (
