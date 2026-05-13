@@ -2,26 +2,22 @@
 """
 strike_playwright.py
 
-Browser-driven version of strike.py. At a designated strike time
-(17:00 or 20:00 Berlin), one Playwright browser per target slot is
-pre-warmed up to the redeem page, then each polls its cart-add button
-for the disabled->enabled transition. The first browser to detect the
-transition fires the full booking flow.
+Browser-driven strike script. Pre-warms one Playwright browser context
+per target slot to the redeem page, then at strike time (17:00 or 20:00
+Berlin) polls each context's cart-add button by reloading the page and
+checking whether the button is present and enabled.
 
-Replaces strike.py for the actual race; strike.py with its requests-
-based approach has been demonstrated unreliable (cart-add returns
-require_cookie redirects from non-browser sessions).
+Polling is sequential across targets (one browser at a time, in a loop)
+because Playwright's sync API is not thread-safe. With ~330ms per
+reload-check and 2-4 targets, each individual slot is rechecked every
+~660-1300ms during the strike window.
 
 Hard guardrails:
-- Single concurrent booking (threading lock + stop_signal)
+- Single concurrent booking (loop breaks on first success)
 - Daily booking limit (DAILY_BOOKING_LIMIT, default 2)
 - Friday exclusion (EXCLUDED_WEEKDAYS)
 - Sleep until the actual strike-hour boundary so polling starts at
   release time, not "whenever pre-warm finishes"
-
-Designed to be invoked by a systemd timer ~3 minutes before each
-strike hour (16:57 and 19:57 Berlin) to give Playwright time to launch
-4 Chromium instances and pre-warm them.
 """
 
 from __future__ import annotations
@@ -29,9 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -68,16 +62,11 @@ STRIKE_HOURS = (17, 20)
 # Daily booking cap.
 DAILY_BOOKING_LIMIT = 2
 
-# Days the bot does NOT strike on. Friday reserved for non-bot users.
+# Days the bot does NOT strike on.
 EXCLUDED_WEEKDAYS = {"Fr"}
 
-# How long after the strike hour to keep polling for the cart-add button
-# to enable. Slots typically open within seconds; 60s gives margin.
+# How long after the strike hour to keep polling.
 POLL_DURATION_SECONDS = 60
-
-# Polling interval per browser, in milliseconds. Each target browser polls
-# its own cart-add button independently.
-POLL_INTERVAL_MS = 400
 
 # Per-browser User-Agent so Chromium looks like normal Chrome.
 BROWSER_UA = (
@@ -150,7 +139,7 @@ def record_booking(state: dict, booking: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Target discovery (uses requests, since this is a non-time-critical fetch)
+# Target discovery (uses requests for the lightweight week-overview fetch)
 # ---------------------------------------------------------------------------
 
 def discover_target_slots() -> list[dict]:
@@ -208,79 +197,6 @@ def prewarm_target(browser: Browser, slot: dict, voucher: str) -> TargetBrowser 
 
 
 # ---------------------------------------------------------------------------
-# Per-target poll-and-book worker
-# ---------------------------------------------------------------------------
-
-def poll_and_book(target: TargetBrowser, deadline: float, email: str,
-                  stop_signal: dict, hold_lock: threading.Lock) -> dict | None:
-    """
-    Poll the target's cart-add button until it enables or deadline.
-    On enable, fire cart-add and complete checkout.
-    Returns booking record on success, None otherwise.
-    """
-    sid = target.slot["slot_id"]
-    interval = POLL_INTERVAL_MS / 1000.0
-    rounds = 0
-
-    while time.time() < deadline:
-        if stop_signal.get("done"):
-            return None
-        rounds += 1
-        round_start = time.time()
-        try:
-            if cart_add_button_enabled(target.page):
-                log.info("BUTTON ENABLED %s after %d rounds", sid, rounds)
-
-                # Critical section: only one thread fires the booking.
-                with hold_lock:
-                    if stop_signal.get("done"):
-                        log.info("Another thread already won; aborting %s", sid)
-                        return None
-                    stop_signal["done"] = True  # claim the slot
-
-                    if not fire_cart_add(target.page):
-                        log.error("Cart-add failed for %s", sid)
-                        # Reset stop_signal so other threads can try.
-                        # Note: this is a deliberate exception to the
-                        # "single attempt" rule -- we only made it here
-                        # by claiming the lock, and our claim failed at
-                        # the cart layer. Other threads can race.
-                        stop_signal["done"] = False
-                        return None
-
-                    log.info("Cart added for %s, proceeding to checkout", sid)
-                    order_url = complete_checkout(target.page, email)
-                    if not order_url:
-                        log.error("Checkout failed for %s after cart-add",
-                                  sid)
-                        # Cart-add succeeded but checkout failed. The
-                        # 5-minute hold is now occupying our session.
-                        # Don't release stop_signal -- avoid double-grabs.
-                        return None
-
-                    return {
-                        "slot_id": sid,
-                        "description": (
-                            f"{target.slot['weekday']} {target.slot['date']} "
-                            f"{target.slot['time']} {target.slot['field']}"
-                        ),
-                        "slot_url": target.slot["url"],
-                        "order_url": order_url,
-                        "booked_at": datetime.now().isoformat(timespec="seconds"),
-                    }
-        except Exception as e:
-            log.warning("Poll error on %s: %s", sid, e)
-
-        elapsed = time.time() - round_start
-        if elapsed < interval:
-            time.sleep(interval - elapsed)
-
-    log.info("Deadline reached for %s without button enabling (%d rounds)",
-             sid, rounds)
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -333,30 +249,69 @@ def strike() -> int:
                 log.error("No targets pre-warmed; exiting")
                 return 0
 
-            # Sleep until the strike-hour boundary in Berlin time.
+            # Sleep until the actual strike-hour boundary in Berlin time.
             sleep_until_strike_time()
 
-            log.info("Strike time. Polling for %ds, %dms per cycle. "
-                     "Bookings used today: %d/%d.",
-                     POLL_DURATION_SECONDS, POLL_INTERVAL_MS,
+            log.info("Strike time. Polling sequentially across %d target(s) "
+                     "for %ds. Bookings used today: %d/%d.",
+                     len(targets), POLL_DURATION_SECONDS,
                      booked_today, DAILY_BOOKING_LIMIT)
 
             deadline = time.time() + POLL_DURATION_SECONDS
-            stop_signal: dict = {"done": False}
-            hold_lock = threading.Lock()
-            winner = None
+            winner: dict | None = None
+            rounds_per_target = {t.slot["slot_id"]: 0 for t in targets}
 
-            with ThreadPoolExecutor(max_workers=len(targets)) as pool:
-                futures = [
-                    pool.submit(poll_and_book, t, deadline, email,
-                                stop_signal, hold_lock)
-                    for t in targets
-                ]
-                for fut in as_completed(futures):
-                    result = fut.result()
-                    if result:
-                        winner = result
+            # Sequential polling loop. Iterate over all targets, then repeat.
+            # Each iteration of the outer loop is one "round" across all
+            # targets; each inner iteration polls one target.
+            while time.time() < deadline and winner is None:
+                for target in targets:
+                    if time.time() >= deadline:
                         break
+                    sid = target.slot["slot_id"]
+                    rounds_per_target[sid] += 1
+
+                    try:
+                        if not cart_add_button_enabled(target.page):
+                            continue  # Slot not yet open or button absent
+                        log.info("BUTTON ENABLED %s after %d rounds",
+                                 sid, rounds_per_target[sid])
+                    except Exception as e:
+                        log.warning("Poll error on %s: %s", sid, e)
+                        continue
+
+                    # Button is enabled. Attempt the booking.
+                    try:
+                        if not fire_cart_add(target.page):
+                            log.error("Cart-add failed for %s after button enabled",
+                                      sid)
+                            continue
+                        log.info("Cart added for %s, proceeding to checkout", sid)
+
+                        order_url = complete_checkout(target.page, email)
+                        if not order_url:
+                            log.error("Checkout failed for %s after cart-add",
+                                      sid)
+                            # Don't try another slot -- the 5-minute hold from
+                            # this attempt is occupying our session and we'd
+                            # double-hold if we proceed.
+                            winner = None
+                            break
+                    except Exception as e:
+                        log.error("Booking exception for %s: %s", sid, e)
+                        continue
+
+                    winner = {
+                        "slot_id": sid,
+                        "description": (
+                            f"{target.slot['weekday']} {target.slot['date']} "
+                            f"{target.slot['time']} {target.slot['field']}"
+                        ),
+                        "slot_url": target.slot["url"],
+                        "order_url": order_url,
+                        "booked_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    break  # Exit inner for-loop; outer while will see winner
 
             # Cleanup all contexts
             for t in targets:
@@ -366,10 +321,15 @@ def strike() -> int:
                     pass
 
             if not winner:
-                log.info("Strike ended with no booking")
+                summary = ", ".join(
+                    f"{sid}:{n}" for sid, n in rounds_per_target.items()
+                )
+                log.info("Strike ended with no booking. Rounds per target: %s",
+                         summary)
                 notify_telegram(
                     "⚠️ Strike: no slots booked",
-                    "Polling completed but no slot was successfully booked.",
+                    "Polling completed but no slot was successfully booked.\n"
+                    f"Rounds per target: {summary}",
                 )
                 return 0
 
