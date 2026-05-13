@@ -61,15 +61,25 @@ def prewarm_to_redeem(page: Page, slot_id: str, voucher: str,
         return False
 
 
-def cart_add_button_enabled(page: Page) -> bool:
-    """Check if the cart-add button is currently clickable."""
+def cart_add_button_enabled(page) -> bool:
+    """
+    Reload the page and check if the cart-add button is currently enabled.
+
+    Important: pretix pages are server-rendered. The button's disabled
+    attribute reflects server state at the moment of page load and does
+    not update via JavaScript. To detect the slot transitioning from
+    "not yet open" to "open", we must reload the page on each poll.
+
+    A human would refresh F5 until the button enables — this mimics that.
+    """
     try:
+        page.reload(wait_until="domcontentloaded", timeout=8000)
         btn = page.get_by_role(
             "button", name="Zum Warenkorb hinzufügen"
         ).first
-        # `disabled` attribute returns None when not present
         return btn.get_attribute("disabled") is None
-    except Exception:
+    except Exception as e:
+        log.warning("Reload+check failed: %s", e)
         return False
 
 
