@@ -9,13 +9,19 @@ checking whether the button is present and enabled.
 
 Polling is sequential across targets (one browser at a time, in a loop)
 because Playwright's sync API is not thread-safe. With ~330ms per
-reload-check and 2-4 targets, each individual slot is rechecked every
-~660-1300ms during the strike window.
+reload-check and 2 targets per strike, each individual slot is rechecked
+every ~660ms during the strike window.
+
+Strike-hour-aware target filtering:
+- The 17:00 strike polls only Feld 1 slots (Feld 2 isn't released yet at
+  17:00, polling for it is wasted bandwidth).
+- The 20:00 strike polls only Feld 2 slots (Feld 1 is long gone by 20:00).
 
 Hard guardrails:
 - Single concurrent booking (loop breaks on first success)
 - Daily booking limit (DAILY_BOOKING_LIMIT, default 2)
-- Friday exclusion (EXCLUDED_WEEKDAYS)
+- Weekday exclusion (EXCLUDED_WEEKDAYS): Wed and Fri reserved for
+  non-bot users
 - Sleep until the actual strike-hour boundary so polling starts at
   release time, not "whenever pre-warm finishes"
 """
@@ -62,8 +68,8 @@ STRIKE_HOURS = (17, 20)
 # Daily booking cap.
 DAILY_BOOKING_LIMIT = 2
 
-# Days the bot does NOT strike on.
-EXCLUDED_WEEKDAYS = {"Fr"}
+# Days the bot does NOT strike on. Wed and Fri reserved for non-bot users.
+EXCLUDED_WEEKDAYS = {"Mi", "Fr"}
 
 # How long after the strike hour to keep polling.
 POLL_DURATION_SECONDS = 60
@@ -142,7 +148,12 @@ def record_booking(state: dict, booking: dict) -> None:
 # Target discovery (uses requests for the lightweight week-overview fetch)
 # ---------------------------------------------------------------------------
 
-def discover_target_slots() -> list[dict]:
+def discover_target_slots(active_field: str | None = None) -> list[dict]:
+    """
+    Find all slots matching today's weekday and the PREFERRED_SLOTS list.
+    If active_field is provided (e.g. "Feld 1" or "Feld 2"), further
+    restrict results to that field only.
+    """
     import requests
     today_abbr = todays_weekday_abbr()
     weeks = weeks_to_watch(WEEK_OFFSETS)
@@ -161,12 +172,13 @@ def discover_target_slots() -> list[dict]:
         slot for slot in all_slots
         if slot["weekday"] == today_abbr
         and (slot["weekday"], slot["time"], slot["field"]) in PREFERRED_SLOTS
+        and (active_field is None or slot["field"] == active_field)
     ]
-    log.info("Found %d target slot(s) for %s in week %s",
-             len(targets), today_abbr, weeks[0])
-    for s in targets:
+    log.info("Found %d target slot(s) for %s in week %s (field filter: %s)",
+             len(targets), today_abbr, weeks[0], active_field or "all")
+    for slot in targets:
         log.info("  - %s %s %s [id=%s]",
-                 s["weekday"], s["time"], s["field"], s["slot_id"])
+                 slot["weekday"], slot["time"], slot["field"], slot["slot_id"])
     return targets
 
 
@@ -222,7 +234,23 @@ def strike() -> int:
                  DAILY_BOOKING_LIMIT)
         return 0
 
-    target_slots = discover_target_slots()
+    # Determine which strike hour we're firing for, and restrict targets
+    # accordingly. The 17:00 strike releases Feld 1; the 20:00 strike
+    # releases Feld 2. Polling for the opposite field at each hour is
+    # always wasted bandwidth.
+    next_strike_berlin = next_strike_time().astimezone(BERLIN_TZ)
+    strike_hour = next_strike_berlin.hour
+    if strike_hour == 17:
+        active_field = "Feld 1"
+    elif strike_hour == 20:
+        active_field = "Feld 2"
+    else:
+        log.error("Unexpected strike hour %d; aborting", strike_hour)
+        return 1
+    log.info("Strike for %02d:00 Berlin -- targeting %s only",
+             strike_hour, active_field)
+
+    target_slots = discover_target_slots(active_field)
     if not target_slots:
         log.info("No target slots; exiting")
         return 0
@@ -262,8 +290,6 @@ def strike() -> int:
             rounds_per_target = {t.slot["slot_id"]: 0 for t in targets}
 
             # Sequential polling loop. Iterate over all targets, then repeat.
-            # Each iteration of the outer loop is one "round" across all
-            # targets; each inner iteration polls one target.
             while time.time() < deadline and winner is None:
                 for target in targets:
                     if time.time() >= deadline:
@@ -327,7 +353,7 @@ def strike() -> int:
                 log.info("Strike ended with no booking. Rounds per target: %s",
                          summary)
                 notify_telegram(
-                    "⚠️ Strike: no slots booked",
+                    "Strike: no slots booked",
                     "Polling completed but no slot was successfully booked.\n"
                     f"Rounds per target: {summary}",
                 )
@@ -338,9 +364,9 @@ def strike() -> int:
             state.pop("active_hold", None)
             save_state(state)
 
-            title = f"✅ BOOKED: {winner['description']}"
+            title = f"BOOKED: {winner['description']}"
             body = (
-                f"Booking confirmed (€0 with voucher).\n\n"
+                f"Booking confirmed (0 EUR with voucher).\n\n"
                 f"Order details / cancel link:\n{winner['order_url']}\n\n"
                 f"Who's coming? Reply in this channel.\n"
                 f"Bookings used today: {booked_today + 1}/{DAILY_BOOKING_LIMIT}."
