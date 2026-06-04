@@ -96,42 +96,50 @@ BERLIN_TZ = ZoneInfo("Europe/Berlin")
 # Time helpers
 # ---------------------------------------------------------------------------
 
-def next_strike_time() -> datetime:
-    """Returns next datetime (UTC) at which a strike-hour boundary occurs."""
+def next_release_time_berlin() -> datetime:
+    """Returns the next real strike release boundary in Berlin time."""
     now_berlin = datetime.now(BERLIN_TZ)
     candidates = []
+
     for hour in STRIKE_HOURS:
-     candidate = (
-            now_berlin.replace(
-                hour=hour,
-                minute=0,
-                second=0,
-                microsecond=0,
-            )
-            - timedelta(seconds=1)
+        candidate = now_berlin.replace(
+            hour=hour,
+            minute=0,
+            second=0,
+            microsecond=0,
         )
         if candidate <= now_berlin:
             candidate += timedelta(days=1)
         candidates.append(candidate)
-    return min(candidates).astimezone(ZoneInfo("UTC"))
+
+    return min(candidates)
+
+
+def next_poll_start_time() -> datetime:
+    """Returns the UTC time when polling should begin: 1s before release."""
+    return (next_release_time_berlin() - timedelta(seconds=1)).astimezone(
+        ZoneInfo("UTC")
+    )
 
 
 def sleep_until_strike_time() -> None:
-    target = next_strike_time()
+    target = next_poll_start_time()
     now = datetime.now(ZoneInfo("UTC"))
     wait = (target - now).total_seconds()
 
     if wait <= 0:
-        log.info("Strike time already passed (%.2fs late). Polling now.", -wait)
+        log.info("Strike pre-start time already passed (%.2fs late). Polling now.", -wait)
         return
     if wait > 600:
-        log.warning("Strike time is %.0fs away (>10min). Polling now anyway.", wait)
+        log.warning("Strike pre-start time is %.0fs away (>10min). Polling now anyway.", wait)
         return
 
-    log.info("Sleeping %.2fs until strike time %s",
-             wait, target.astimezone(BERLIN_TZ).isoformat(timespec="seconds"))
+    log.info(
+        "Sleeping %.2fs until poll start time %s",
+        wait,
+        target.astimezone(BERLIN_TZ).isoformat(timespec="seconds"),
+    )
     time.sleep(wait)
-
 
 # ---------------------------------------------------------------------------
 # Booking limit helpers
@@ -246,7 +254,7 @@ def strike() -> int:
     # accordingly. The 17:00 strike releases Feld 1; the 20:00 strike
     # releases Feld 2. Polling for the opposite field at each hour is
     # always wasted bandwidth.
-    next_strike_berlin = next_strike_time().astimezone(BERLIN_TZ)
+    next_strike_berlin = next_release_time_berlin()
     strike_hour = next_strike_berlin.hour
     if strike_hour == 17:
         active_field = "Feld 1"
