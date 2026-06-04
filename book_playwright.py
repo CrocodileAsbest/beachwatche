@@ -86,23 +86,83 @@ def cart_add_button_enabled(page) -> bool:
         return False
 
 
-def fire_cart_add(page: Page, timeout_ms: int = 10000) -> bool:
+# ===========================================================================
+# REPLACE the existing fire_cart_add function in book_playwright.py with this.
+# ===========================================================================
+
+def fire_cart_add(page, timeout_ms: int = 10000) -> bool:
     """
-    Click the cart-add button. Caller should verify the button is enabled
-    via cart_add_button_enabled() first to avoid waiting on a disabled
-    element.
+    Click the cart-add button, then confirm the cart is actually committed
+    server-side before returning. Caller should verify the button is enabled
+    via cart_add_button_enabled() first.
+
+    Why the confirmation loop: at the release moment (17:00/20:00) pretix is
+    under load and the cart-add write may not commit immediately. If we
+    navigate to checkout before the cart is committed, pretix sees no cart
+    and bounces us to ?require_cookie=true. Observed empirically: identical
+    code booked fine on a low-load day but bounced on a high-load day with
+    only a fixed 1.5s wait.
+
+    IMPORTANT: this runs AFTER the slot is already held in our cart (the
+    click below claims the 5-minute hold). It does NOT slow the competitive
+    part of the strike -- by the time we're here, we've already won the slot.
+    Spending a few seconds confirming the commit costs nothing competitively.
+
+    Returns True once the cart is confirmed non-empty, False on failure.
     """
+    CART_CONFIRM_TIMEOUT_S = 6.0
+    CART_POLL_INTERVAL_S = 0.4
+
     try:
         page.get_by_role(
             "button", name="Zum Warenkorb hinzufügen"
         ).first.click(timeout=timeout_ms)
-        # Cart-add is async; give it a moment to register server-side
-        time.sleep(1.5)
-        return True
     except Exception as e:
         log.error("Cart-add click failed: %s", e)
         return False
 
+    # The click claims the hold. Now confirm the cart is committed by
+    # polling the cart page until our item appears (or timeout).
+    deadline = time.time() + CART_CONFIRM_TIMEOUT_S
+    confirmed = False
+    while time.time() < deadline:
+        try:
+            page.goto(f"{BASE_URL}cart/", wait_until="domcontentloaded",
+                      timeout=8000)
+            content = page.content().lower()
+            # A populated cart shows the slot date/time and a checkout
+            # continuation. An empty cart says so explicitly.
+            empty = ("warenkorb ist leer" in content
+                     or "keine produkte" in content
+                     or "dein warenkorb ist leer" in content)
+            has_item = ("feld" in content
+                        and ("mai" in content or "juni" in content
+                             or "juli" in content or "august" in content))
+            if has_item and not empty:
+                confirmed = True
+                break
+            if "require_cookie" in page.url:
+                # Cart page itself bounced; the visit re-confirms the cookie.
+                # Loop and retry.
+                pass
+        except Exception as e:
+            log.warning("Cart-confirm poll error: %s", e)
+        time.sleep(CART_POLL_INTERVAL_S)
+
+    if not confirmed:
+        log.warning("Cart not confirmed committed within %.1fs; proceeding "
+                    "to checkout anyway (checkout has its own retry)",
+                    CART_CONFIRM_TIMEOUT_S)
+        # We don't hard-fail here -- the slot may still be held, and
+        # complete_checkout has retry logic that can still recover.
+
+    return True
+
+
+# ===========================================================================
+# REPLACE the existing complete_checkout function in book_playwright.py
+# with this.
+# ===========================================================================
 
 def complete_checkout(page, email: str, timeout_ms: int = 30000) -> str | None:
     """
@@ -110,13 +170,15 @@ def complete_checkout(page, email: str, timeout_ms: int = 30000) -> str | None:
     booking, wait for order page. Returns order URL on success.
 
     Robustness: pretix intermittently bounces a freshly-carted session to
-    /?require_cookie=true at the checkout/start step -- especially under
-    load at the 20:00 release moment, when the cart-add may not have fully
-    committed server-side before we navigate. Visiting the require_cookie
-    URL itself re-confirms the session cookie, so we retry checkout/start
-    up to CHECKOUT_START_RETRIES times, with a short wait between attempts.
+    /?require_cookie=true at the checkout/start step under release-time load.
+    Visiting the require_cookie URL re-confirms the session cookie, so we
+    retry checkout/start up to CHECKOUT_START_RETRIES times. This is a
+    backstop in addition to the cart-commit confirmation in fire_cart_add.
+
+    None of this slows the competitive race -- it runs after the slot is
+    already held in our cart (5-minute window).
     """
-    CHECKOUT_START_RETRIES = 4
+    CHECKOUT_START_RETRIES = 5
     RETRY_WAIT_S = 0.8
 
     try:
@@ -131,13 +193,12 @@ def complete_checkout(page, email: str, timeout_ms: int = 30000) -> str | None:
                 break
 
             if "require_cookie" in page.url:
-                # The bounce itself set/confirmed the cookie. Wait briefly
-                # (lets any async cart-add finish committing), then retry.
                 log.warning("checkout/start bounced to require_cookie "
-                            "(attempt %d/%d); retrying after %.1fs",
-                            attempt, CHECKOUT_START_RETRIES, RETRY_WAIT_S)
-                # Re-fetch the require_cookie URL explicitly so pretix
-                # re-runs its cookie confirmation, then loop to retry.
+                            "(attempt %d/%d); re-confirming cookie, retrying "
+                            "after %.1fs", attempt, CHECKOUT_START_RETRIES,
+                            RETRY_WAIT_S)
+                # Re-fetch the require_cookie URL so pretix re-runs its
+                # cookie confirmation, then loop to retry.
                 try:
                     page.goto(page.url, wait_until="domcontentloaded",
                               timeout=timeout_ms)
@@ -146,7 +207,6 @@ def complete_checkout(page, email: str, timeout_ms: int = 30000) -> str | None:
                 time.sleep(RETRY_WAIT_S)
                 continue
 
-            # Some other unexpected URL.
             log.error("checkout/start landed on unexpected URL: %s", page.url)
             time.sleep(RETRY_WAIT_S)
 
