@@ -104,18 +104,55 @@ def fire_cart_add(page: Page, timeout_ms: int = 10000) -> bool:
         return False
 
 
-def complete_checkout(page: Page, email: str,
-                      timeout_ms: int = 30000) -> str | None:
+def complete_checkout(page, email: str, timeout_ms: int = 30000) -> str | None:
     """
-    Steps 5-8: Navigate to checkout, submit email, confirm terms,
-    submit booking, wait for order page. Returns order URL on success.
+    Steps 5-8: Navigate to checkout, submit email, confirm terms, submit
+    booking, wait for order page. Returns order URL on success.
+
+    Robustness: pretix intermittently bounces a freshly-carted session to
+    /?require_cookie=true at the checkout/start step -- especially under
+    load at the 20:00 release moment, when the cart-add may not have fully
+    committed server-side before we navigate. Visiting the require_cookie
+    URL itself re-confirms the session cookie, so we retry checkout/start
+    up to CHECKOUT_START_RETRIES times, with a short wait between attempts.
     """
+    CHECKOUT_START_RETRIES = 4
+    RETRY_WAIT_S = 0.8
+
     try:
-        # Step 5: navigate to checkout (redirects to questions)
-        page.goto(f"{BASE_URL}checkout/start",
-                  wait_until="domcontentloaded", timeout=timeout_ms)
-        if "/checkout/questions" not in page.url:
-            log.error("Expected questions page, got: %s", page.url)
+        # Step 5: navigate into checkout. Retry on require_cookie bounce.
+        landed_on_questions = False
+        for attempt in range(1, CHECKOUT_START_RETRIES + 1):
+            page.goto(f"{BASE_URL}checkout/start",
+                      wait_until="domcontentloaded", timeout=timeout_ms)
+
+            if "/checkout/questions" in page.url:
+                landed_on_questions = True
+                break
+
+            if "require_cookie" in page.url:
+                # The bounce itself set/confirmed the cookie. Wait briefly
+                # (lets any async cart-add finish committing), then retry.
+                log.warning("checkout/start bounced to require_cookie "
+                            "(attempt %d/%d); retrying after %.1fs",
+                            attempt, CHECKOUT_START_RETRIES, RETRY_WAIT_S)
+                # Re-fetch the require_cookie URL explicitly so pretix
+                # re-runs its cookie confirmation, then loop to retry.
+                try:
+                    page.goto(page.url, wait_until="domcontentloaded",
+                              timeout=timeout_ms)
+                except Exception:
+                    pass
+                time.sleep(RETRY_WAIT_S)
+                continue
+
+            # Some other unexpected URL.
+            log.error("checkout/start landed on unexpected URL: %s", page.url)
+            time.sleep(RETRY_WAIT_S)
+
+        if not landed_on_questions:
+            log.error("Could not reach /checkout/questions/ after %d attempts; "
+                      "last URL: %s", CHECKOUT_START_RETRIES, page.url)
             return None
 
         # Step 6: submit email
@@ -127,23 +164,15 @@ def complete_checkout(page: Page, email: str,
             return None
 
         # Step 7: tick terms checkbox and submit
-        page.locator(
-            'input[type="checkbox"][name^="confirm_"]'
-        ).first.check()
-        page.get_by_role(
-            "button", name="Anmeldung abschicken"
-        ).first.click()
+        page.locator('input[type="checkbox"][name^="confirm_"]').first.check()
+        page.get_by_role("button", name="Anmeldung abschicken").first.click()
 
-        # Step 8: wait for redirect to order page (up to 60s; pretix
-        # processes async and may take a bit)
+        # Step 8: wait for redirect to order page
         page.wait_for_url("**/order/**", timeout=60000)
         order_url = page.url
         log.info("Booking confirmed: %s", order_url)
         return order_url
 
-    except PWTimeout as e:
-        log.error("Checkout timeout: %s", e)
-        return None
     except Exception as e:
         log.error("Checkout error: %s", e)
         return None
