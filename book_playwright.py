@@ -90,28 +90,44 @@ def cart_add_button_enabled(page) -> bool:
 # REPLACE the existing fire_cart_add function in book_playwright.py with this.
 # ===========================================================================
 
+# ===========================================================================
+# REPLACE fire_cart_add in book_playwright.py with this corrected version.
+# (complete_checkout from the previous patch stays as-is -- it's fine.)
+# ===========================================================================
+
 def fire_cart_add(page, timeout_ms: int = 10000) -> bool:
     """
-    Click the cart-add button, then confirm the cart is actually committed
-    server-side before returning. Caller should verify the button is enabled
-    via cart_add_button_enabled() first.
+    Click the cart-add button, then confirm the cart is committed by checking
+    the CURRENT page for pretix's success message. Caller should verify the
+    button is enabled via cart_add_button_enabled() first.
 
-    Why the confirmation loop: at the release moment (17:00/20:00) pretix is
-    under load and the cart-add write may not commit immediately. If we
-    navigate to checkout before the cart is committed, pretix sees no cart
-    and bounces us to ?require_cookie=true. Observed empirically: identical
-    code booked fine on a low-load day but bounced on a high-load day with
-    only a fixed 1.5s wait.
+    Cart-add on this pretix instance is an inline update: the URL stays on
+    /redeem?... and the page re-renders to show "Die gewählten Produkte
+    wurden deinem Warenkorb hinzugefügt." plus the cart widget. There is NO
+    separate /cart/ page (it 404s). So we confirm by polling the current
+    page content, not by navigating anywhere.
 
-    IMPORTANT: this runs AFTER the slot is already held in our cart (the
-    click below claims the 5-minute hold). It does NOT slow the competitive
-    part of the strike -- by the time we're here, we've already won the slot.
-    Spending a few seconds confirming the commit costs nothing competitively.
+    Why confirm at all: at release-time load, the cart-add may take a moment
+    to commit. Confirming before we navigate to checkout avoids the
+    ?require_cookie=true bounce that happens when checkout/start fires against
+    an uncommitted cart.
 
-    Returns True once the cart is confirmed non-empty, False on failure.
+    IMPORTANT: this runs AFTER the click that claims the 5-minute hold, so it
+    does NOT slow the competitive part of the strike. By the time we're here,
+    the slot is already ours for 5 minutes.
+
+    Returns True once the cart is confirmed (or after the click if confirmation
+    times out -- complete_checkout has its own retry backstop).
     """
-    CART_CONFIRM_TIMEOUT_S = 6.0
-    CART_POLL_INTERVAL_S = 0.4
+    CART_CONFIRM_TIMEOUT_S = 5.0
+    CART_POLL_INTERVAL_S = 0.3
+
+    # Strings that indicate a committed cart on the current page.
+    CONFIRM_MARKERS = (
+        "deinem warenkorb hinzugefügt",   # "...added to your cart"
+        "dein warenkorb",                  # cart widget heading
+        "minuten für dich reserviert",     # the hold-timer text
+    )
 
     try:
         page.get_by_role(
@@ -121,44 +137,34 @@ def fire_cart_add(page, timeout_ms: int = 10000) -> bool:
         log.error("Cart-add click failed: %s", e)
         return False
 
-    # The click claims the hold. Now confirm the cart is committed by
-    # polling the cart page until our item appears (or timeout).
+    # Confirm the cart committed by polling the CURRENT page content.
+    # No navigation -- cart-add is an inline re-render.
     deadline = time.time() + CART_CONFIRM_TIMEOUT_S
     confirmed = False
     while time.time() < deadline:
         try:
-            page.goto(f"{BASE_URL}cart/", wait_until="domcontentloaded",
-                      timeout=8000)
             content = page.content().lower()
-            # A populated cart shows the slot date/time and a checkout
-            # continuation. An empty cart says so explicitly.
-            empty = ("warenkorb ist leer" in content
-                     or "keine produkte" in content
-                     or "dein warenkorb ist leer" in content)
-            has_item = ("feld" in content
-                        and ("mai" in content or "juni" in content
-                             or "juli" in content or "august" in content))
-            if has_item and not empty:
+            if any(marker in content for marker in CONFIRM_MARKERS):
                 confirmed = True
                 break
-            if "require_cookie" in page.url:
-                # Cart page itself bounced; the visit re-confirms the cookie.
-                # Loop and retry.
-                pass
         except Exception as e:
-            log.warning("Cart-confirm poll error: %s", e)
+            log.warning("Cart-confirm read error: %s", e)
         time.sleep(CART_POLL_INTERVAL_S)
+        # The page may still be settling after the click; a light reload
+        # ensures we see the committed state. Only reload if not yet confirmed.
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=8000)
+        except Exception:
+            pass
 
-    if not confirmed:
-        log.warning("Cart not confirmed committed within %.1fs; proceeding "
-                    "to checkout anyway (checkout has its own retry)",
+    if confirmed:
+        log.info("Cart commit confirmed on page")
+    else:
+        log.warning("Cart commit not confirmed within %.1fs; proceeding to "
+                    "checkout anyway (checkout has its own retry)",
                     CART_CONFIRM_TIMEOUT_S)
-        # We don't hard-fail here -- the slot may still be held, and
-        # complete_checkout has retry logic that can still recover.
 
     return True
-
-
 # ===========================================================================
 # REPLACE the existing complete_checkout function in book_playwright.py
 # with this.
