@@ -101,7 +101,7 @@ def next_strike_time() -> datetime:
     now_berlin = datetime.now(BERLIN_TZ)
     candidates = []
     for hour in STRIKE_HOURS:
- candidate = (
+     candidate = (
             now_berlin.replace(
                 hour=hour,
                 minute=0,
