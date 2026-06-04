@@ -101,7 +101,15 @@ def next_strike_time() -> datetime:
     now_berlin = datetime.now(BERLIN_TZ)
     candidates = []
     for hour in STRIKE_HOURS:
-        candidate = now_berlin.replace(hour=hour, minute=0, second=0, microsecond=0)
+ candidate = (
+            now_berlin.replace(
+                hour=hour,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            - timedelta(seconds=1)
+        )
         if candidate <= now_berlin:
             candidate += timedelta(days=1)
         candidates.append(candidate)
