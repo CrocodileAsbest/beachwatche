@@ -106,73 +106,27 @@ def cart_add_button_enabled(page: Page) -> bool:
 # ---------------------------------------------------------------------------
 
 def fire_cart_add(page: Page, timeout_ms: int = 1500) -> bool:
-    """
-    Click the cart-add button, then briefly confirm the cart was committed.
-
-    Optimized for direct-strike use:
-    - Uses the stable #btn-add-to-cart selector instead of get_by_role().
-    - Uses a short click timeout because the strike script assumes availability
-      at the release boundary.
-    - Does not repeatedly reload while confirming. It checks the current page
-      briefly, then performs at most one fallback reload.
-
-    Returns True after confirmation, or True after confirmation timeout so that
-    complete_checkout() can still try its own checkout/start retry backstop.
-    Returns False only if the cart-add click itself failed.
-    """
-    CART_CONFIRM_TIMEOUT_S = 1.5
-    CART_POLL_INTERVAL_S = 0.1
-
-    confirm_markers = (
-        "deinem warenkorb hinzugefügt",
-        "dein warenkorb",
-        "minuten für dich reserviert",
-        "require_cookie=true",
-    )
-
     try:
-        page.locator(CART_ADD_SELECTOR).first.click(timeout=timeout_ms)
+        page.evaluate("""
+        () => {
+          const btn = document.querySelector("#btn-add-to-cart");
+          if (!btn) throw new Error("cart-add button not found");
+          btn.click();
+        }
+        """)
     except Exception as e:
-        log.error("Cart-add click failed: %s", e)
+        log.error("Cart-add JS click failed: %s", e)
         return False
 
-    deadline = time.time() + CART_CONFIRM_TIMEOUT_S
-    while time.time() < deadline:
-        try:
-            # The async cart-add flow may navigate to require_cookie=true. If so,
-            # the cart was accepted and checkout can proceed.
-            if "require_cookie=true" in page.url:
-                log.info("Cart-add accepted; page reached require_cookie URL")
-                return True
-
-            content = page.content().lower()
-            if any(marker in content for marker in confirm_markers):
-                log.info("Cart commit confirmed on page")
-                return True
-        except Exception as e:
-            log.warning("Cart-confirm read error: %s", e)
-
-        time.sleep(CART_POLL_INTERVAL_S)
-
-    # One fallback reload only. Avoid the previous repeated reload loop.
     try:
-        page.reload(wait_until="domcontentloaded", timeout=5000)
-        if "require_cookie=true" in page.url:
-            log.info("Cart-add accepted after fallback reload")
-            return True
+        page.wait_for_url(
+            lambda url: "/cart/add" in url or "require_cookie=true" in url,
+            timeout=2000,
+        )
+        log.info("Cart-add async flow observed: %s", page.url)
+    except Exception:
+        log.warning("Cart-add JS click sent; proceeding to checkout anyway")
 
-        content = page.content().lower()
-        if any(marker in content for marker in confirm_markers):
-            log.info("Cart commit confirmed after fallback reload")
-            return True
-    except Exception as e:
-        log.warning("Cart-confirm fallback reload failed: %s", e)
-
-    log.warning(
-        "Cart commit not confirmed within %.1fs; proceeding to checkout anyway "
-        "(checkout has its own retry)",
-        CART_CONFIRM_TIMEOUT_S,
-    )
     return True
 
 
