@@ -106,18 +106,26 @@ def cart_add_button_enabled(page: Page) -> bool:
 # ---------------------------------------------------------------------------
 
 def fire_cart_add(page: Page, timeout_ms: int = 1500) -> bool:
+    """
+    Click the cart-add button and return once pretix's async cart-add flow
+    has visibly started.
+
+    pretix handles cart-add through an AJAX POST followed by async navigation
+    to /cart/add?... and often then /?require_cookie=true. We do not poll
+    page.content() here because the page may be actively navigating.
+
+    Returns True once the click succeeds and the flow appears to start.
+    complete_checkout() remains the backstop: if the cart was not actually
+    committed, checkout/start will fail or bounce and retry.
+    """
     try:
-        page.evaluate("""
-        () => {
-          const btn = document.querySelector("#btn-add-to-cart");
-          if (!btn) throw new Error("cart-add button not found");
-          btn.click();
-        }
-        """)
+        page.locator("#btn-add-to-cart").click(timeout=timeout_ms)
     except Exception as e:
-        log.error("Cart-add JS click failed: %s", e)
+        log.error("Cart-add click failed: %s", e)
         return False
 
+    # Optional lightweight confirmation: wait only for the async flow to begin.
+    # Do not require this to succeed; the click itself is the competitive action.
     try:
         page.wait_for_url(
             lambda url: "/cart/add" in url or "require_cookie=true" in url,
@@ -125,10 +133,12 @@ def fire_cart_add(page: Page, timeout_ms: int = 1500) -> bool:
         )
         log.info("Cart-add async flow observed: %s", page.url)
     except Exception:
-        log.warning("Cart-add JS click sent; proceeding to checkout anyway")
+        log.warning(
+            "Cart-add click sent, but async flow URL was not observed within timeout; "
+            "proceeding to checkout anyway"
+        )
 
     return True
-
 
 # ---------------------------------------------------------------------------
 # Checkout
