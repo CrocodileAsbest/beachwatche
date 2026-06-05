@@ -105,21 +105,178 @@ def cart_add_button_enabled(page: Page) -> bool:
 # Cart add
 # ---------------------------------------------------------------------------
 
-def fire_cart_add(page: Page, timeout_ms: int = 1500) -> bool:
+def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
     """
-    Click the cart-add button, then briefly confirm the cart was committed.
+    Experimental direct fetch version.
 
-    Optimized for direct-strike use:
-    - Uses the stable #btn-add-to-cart selector instead of get_by_role().
-    - Uses a short click timeout because the strike script assumes availability
-      at the release boundary.
-    - Does not repeatedly reload while confirming. It checks the current page
-      briefly, then performs at most one fallback reload.
-
-    Returns True after confirmation, or True after confirmation timeout so that
-    complete_checkout() can still try its own checkout/start retry backstop.
-    Returns False only if the cart-add click itself failed.
+    It submits the rendered pretix cart-add form via fetch(), then polls the
+    async check_url returned by pretix until the task is ready. Falls back to
+    the normal button-click flow if direct fetch fails.
     """
+    try:
+        result = page.evaluate(
+            """
+            async ({ timeoutMs }) => {
+              const startedAt = Date.now();
+
+              function remaining() {
+                return Math.max(0, timeoutMs - (Date.now() - startedAt));
+              }
+
+              function sleep(ms) {
+                return new Promise(resolve => setTimeout(resolve, ms));
+              }
+
+              function absoluteUrl(url) {
+                return new URL(url, window.location.origin).toString();
+              }
+
+              const btn = document.querySelector("#btn-add-to-cart");
+              if (!btn) {
+                throw new Error("cart-add button not found");
+              }
+
+              const form = btn.closest("form");
+              if (!form) {
+                throw new Error("cart-add form not found");
+              }
+
+              const fd = new FormData(form);
+              fd.set("ajax", "1");
+
+              const postRes = await fetch(form.action, {
+                method: "POST",
+                body: fd,
+                credentials: "same-origin",
+                headers: {
+                  "X-Requested-With": "XMLHttpRequest",
+                  "Accept": "application/json, text/javascript, */*; q=0.01",
+                },
+              });
+
+              const postText = await postRes.text();
+              let postJson;
+              try {
+                postJson = JSON.parse(postText);
+              } catch (e) {
+                throw new Error("cart-add POST did not return JSON: " + postText.slice(0, 300));
+              }
+
+              if (!postRes.ok) {
+                throw new Error("cart-add POST failed: HTTP " + postRes.status + " " + postText.slice(0, 300));
+              }
+
+              let lastJson = postJson;
+              let checkUrl = postJson.check_url ? absoluteUrl(postJson.check_url) : null;
+
+              if (postJson.ready === true) {
+                return {
+                  ok: true,
+                  phase: "post-ready",
+                  postJson,
+                  lastJson,
+                  redirect: postJson.redirect || postJson.url || null,
+                };
+              }
+
+              if (!checkUrl) {
+                throw new Error("cart-add POST JSON had no check_url: " + postText.slice(0, 500));
+              }
+
+              while (remaining() > 0) {
+                const checkRes = await fetch(checkUrl, {
+                  method: "GET",
+                  credentials: "same-origin",
+                  headers: {
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                  },
+                });
+
+                const checkText = await checkRes.text();
+                let checkJson;
+                try {
+                  checkJson = JSON.parse(checkText);
+                } catch (e) {
+                  throw new Error("cart-add check_url did not return JSON: " + checkText.slice(0, 300));
+                }
+
+                lastJson = checkJson;
+
+                if (checkJson.ready === true) {
+                  return {
+                    ok: true,
+                    phase: "check-ready",
+                    postJson,
+                    lastJson,
+                    redirect: checkJson.redirect || checkJson.url || null,
+                  };
+                }
+
+                if (checkJson.redirect || checkJson.url) {
+                  return {
+                    ok: true,
+                    phase: "check-redirect",
+                    postJson,
+                    lastJson,
+                    redirect: checkJson.redirect || checkJson.url,
+                  };
+                }
+
+                if (checkJson.check_url) {
+                  checkUrl = absoluteUrl(checkJson.check_url);
+                }
+
+                await sleep(100);
+              }
+
+              throw new Error("cart-add async polling timed out; lastJson=" + JSON.stringify(lastJson));
+            }
+            """,
+            {"timeoutMs": timeout_ms},
+        )
+
+        log.info("Direct fetch cart-add phase: %s", result.get("phase"))
+
+        redirect = result.get("redirect")
+        if redirect:
+            if redirect.startswith("/"):
+                redirect = "https://tix.htw.stura-dresden.de" + redirect
+
+            try:
+                page.goto(redirect, wait_until="domcontentloaded", timeout=5000)
+            except Exception as e:
+                log.warning("Direct fetch redirect navigation failed: %s", e)
+
+        else:
+            # Mimic the final cookie-confirm landing that pretix normally does
+            # after cart-add. This is the URL your successful runs reached.
+            try:
+                current = page.url
+                if "/redeem" in current:
+                    # Pull the original next URL from the query string.
+                    page.evaluate(
+                        """
+                        () => {
+                          const params = new URLSearchParams(window.location.search);
+                          const next = params.get("next");
+                          if (next) {
+                            window.location.href = next + (next.includes("?") ? "&" : "?") + "require_cookie=true";
+                          }
+                        }
+                        """
+                    )
+                    page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception as e:
+                log.warning("Direct fetch require_cookie navigation failed: %s", e)
+
+        return True
+
+    except Exception as e:
+        log.warning("Direct fetch cart-add failed, falling back to click flow: %s", e)
+        return fire_cart_add_click_fallback(page, timeout_ms=timeout_ms)
+      
+def fire_cart_add_click_fallback(page: Page, timeout_ms: int = 2500) -> bool:
     CART_CONFIRM_TIMEOUT_S = 1.5
     CART_POLL_INTERVAL_S = 0.1
 
@@ -139,8 +296,6 @@ def fire_cart_add(page: Page, timeout_ms: int = 1500) -> bool:
     deadline = time.time() + CART_CONFIRM_TIMEOUT_S
     while time.time() < deadline:
         try:
-            # The async cart-add flow may navigate to require_cookie=true. If so,
-            # the cart was accepted and checkout can proceed.
             if "require_cookie=true" in page.url:
                 log.info("Cart-add accepted; page reached require_cookie URL")
                 return True
@@ -154,7 +309,6 @@ def fire_cart_add(page: Page, timeout_ms: int = 1500) -> bool:
 
         time.sleep(CART_POLL_INTERVAL_S)
 
-    # One fallback reload only. Avoid the previous repeated reload loop.
     try:
         page.reload(wait_until="domcontentloaded", timeout=5000)
         if "require_cookie=true" in page.url:
@@ -174,7 +328,10 @@ def fire_cart_add(page: Page, timeout_ms: int = 1500) -> bool:
         CART_CONFIRM_TIMEOUT_S,
     )
     return True
-      # ---------------------------------------------------------------------------
+  
+
+
+# ---------------------------------------------------------------------------
 # Checkout
 # ---------------------------------------------------------------------------
 
