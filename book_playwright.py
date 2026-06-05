@@ -107,26 +107,17 @@ def cart_add_button_enabled(page: Page) -> bool:
 
 def fire_cart_add(page: Page, timeout_ms: int = 3500) -> bool:
     """
-    Click the cart-add button.
+    Click the cart-add button and wait until pretix's async cart-add flow
+    has completed enough that checkout/start can safely run.
 
-    pretix may render #btn-add-to-cart disabled briefly until its JS initializes
-    the selected product checkbox/form state. We wait for the selected product
-    input first, then for the button to become enabled, then click via the stable
-    button id.
-
-    This avoids the slower accessibility role lookup while keeping the flow
-    reliable.
+    pretix first sends an AJAX POST to /cart/add. The JSON response may contain
+    ready=false and a check_url. The page then navigates through /cart/add?... and
+    usually lands on ?require_cookie=true. Starting checkout before that finishes
+    can race the navigation and cause net::ERR_ABORTED.
     """
     try:
-        # The actual selected product in the rendered form, e.g. item_8=1.
-        page.locator('form[action*="/cart/add"] input[name^="item_"]:checked').first.wait_for(
-            state="attached",
-            timeout=timeout_ms,
-        )
-
         btn = page.locator("#btn-add-to-cart").first
 
-        # Wait until pretix JS has enabled the submit button.
         page.wait_for_function(
             """
             () => {
@@ -137,21 +128,51 @@ def fire_cart_add(page: Page, timeout_ms: int = 3500) -> bool:
             timeout=timeout_ms,
         )
 
-        btn.click(timeout=timeout_ms)
+        with page.expect_response(
+            lambda r: "/cart/add" in r.url and r.request.method == "POST",
+            timeout=timeout_ms,
+        ) as post_resp_info:
+            btn.click(timeout=timeout_ms)
+
+        post_resp = post_resp_info.value
+        if post_resp.status >= 400:
+            log.error("Cart-add POST failed with status %s", post_resp.status)
+            return False
+
+        # The POST only starts pretix's async task. Wait for the follow-up
+        # navigation to settle before checkout.
+        try:
+            page.wait_for_url(
+                lambda url: "require_cookie=true" in url or "/cart/add" in url,
+                timeout=4000,
+            )
+        except Exception:
+            pass
+
+        # If we only caught /cart/add, wait a little longer for the final
+        # require_cookie landing page. This avoids racing checkout/start.
+        try:
+            page.wait_for_url(
+                lambda url: "require_cookie=true" in url,
+                timeout=4000,
+            )
+        except Exception:
+            log.warning(
+                "Cart-add POST succeeded, but require_cookie landing was not observed; "
+                "continuing to checkout anyway"
+            )
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=3000)
+        except Exception:
+            pass
+
+        return True
 
     except Exception as e:
         log.error("Cart-add click failed: %s", e)
         return False
-
-    # Do not read page.content() here; pretix may be navigating through the
-    # async cart-add flow, which can race with content reads.
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=2000)
-    except Exception:
-        pass
-
-    return True
-# ---------------------------------------------------------------------------
+      # ---------------------------------------------------------------------------
 # Checkout
 # ---------------------------------------------------------------------------
 
