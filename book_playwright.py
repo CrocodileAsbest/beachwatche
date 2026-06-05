@@ -105,73 +105,75 @@ def cart_add_button_enabled(page: Page) -> bool:
 # Cart add
 # ---------------------------------------------------------------------------
 
-def fire_cart_add(page: Page, timeout_ms: int = 3500) -> bool:
+def fire_cart_add(page: Page, timeout_ms: int = 1500) -> bool:
     """
-    Click the cart-add button and wait until pretix's async cart-add flow
-    has completed enough that checkout/start can safely run.
+    Click the cart-add button, then briefly confirm the cart was committed.
 
-    pretix first sends an AJAX POST to /cart/add. The JSON response may contain
-    ready=false and a check_url. The page then navigates through /cart/add?... and
-    usually lands on ?require_cookie=true. Starting checkout before that finishes
-    can race the navigation and cause net::ERR_ABORTED.
+    Optimized for direct-strike use:
+    - Uses the stable #btn-add-to-cart selector instead of get_by_role().
+    - Uses a short click timeout because the strike script assumes availability
+      at the release boundary.
+    - Does not repeatedly reload while confirming. It checks the current page
+      briefly, then performs at most one fallback reload.
+
+    Returns True after confirmation, or True after confirmation timeout so that
+    complete_checkout() can still try its own checkout/start retry backstop.
+    Returns False only if the cart-add click itself failed.
     """
+    CART_CONFIRM_TIMEOUT_S = 1.5
+    CART_POLL_INTERVAL_S = 0.1
+
+    confirm_markers = (
+        "deinem warenkorb hinzugefügt",
+        "dein warenkorb",
+        "minuten für dich reserviert",
+        "require_cookie=true",
+    )
+
     try:
-        btn = page.locator("#btn-add-to-cart").first
-
-        page.wait_for_function(
-            """
-            () => {
-              const btn = document.querySelector("#btn-add-to-cart");
-              return btn && !btn.disabled;
-            }
-            """,
-            timeout=timeout_ms,
-        )
-
-        with page.expect_response(
-            lambda r: "/cart/add" in r.url and r.request.method == "POST",
-            timeout=timeout_ms,
-        ) as post_resp_info:
-            btn.click(timeout=timeout_ms)
-
-        post_resp = post_resp_info.value
-        if post_resp.status >= 400:
-            log.error("Cart-add POST failed with status %s", post_resp.status)
-            return False
-
-        # The POST only starts pretix's async task. Wait for the follow-up
-        # navigation to settle before checkout.
-        try:
-            page.wait_for_url(
-                lambda url: "require_cookie=true" in url or "/cart/add" in url,
-                timeout=4000,
-            )
-        except Exception:
-            pass
-
-        # If we only caught /cart/add, wait a little longer for the final
-        # require_cookie landing page. This avoids racing checkout/start.
-        try:
-            page.wait_for_url(
-                lambda url: "require_cookie=true" in url,
-                timeout=4000,
-            )
-        except Exception:
-            log.warning(
-                "Cart-add POST succeeded, but require_cookie landing was not observed; "
-                "continuing to checkout anyway"
-            )
-
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=3000)
-        except Exception:
-            pass
-
-        return True
-
+        page.locator(CART_ADD_SELECTOR).first.click(timeout=timeout_ms)
     except Exception as e:
         log.error("Cart-add click failed: %s", e)
         return False
+
+    deadline = time.time() + CART_CONFIRM_TIMEOUT_S
+    while time.time() < deadline:
+        try:
+            # The async cart-add flow may navigate to require_cookie=true. If so,
+            # the cart was accepted and checkout can proceed.
+            if "require_cookie=true" in page.url:
+                log.info("Cart-add accepted; page reached require_cookie URL")
+                return True
+
+            content = page.content().lower()
+            if any(marker in content for marker in confirm_markers):
+                log.info("Cart commit confirmed on page")
+                return True
+        except Exception as e:
+            log.warning("Cart-confirm read error: %s", e)
+
+        time.sleep(CART_POLL_INTERVAL_S)
+
+    # One fallback reload only. Avoid the previous repeated reload loop.
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=5000)
+        if "require_cookie=true" in page.url:
+            log.info("Cart-add accepted after fallback reload")
+            return True
+
+        content = page.content().lower()
+        if any(marker in content for marker in confirm_markers):
+            log.info("Cart commit confirmed after fallback reload")
+            return True
+    except Exception as e:
+        log.warning("Cart-confirm fallback reload failed: %s", e)
+
+    log.warning(
+        "Cart commit not confirmed within %.1fs; proceeding to checkout anyway "
+        "(checkout has its own retry)",
+        CART_CONFIRM_TIMEOUT_S,
+    )
+    return True
       # ---------------------------------------------------------------------------
 # Checkout
 # ---------------------------------------------------------------------------
