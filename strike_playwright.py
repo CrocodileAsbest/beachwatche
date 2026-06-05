@@ -286,16 +286,13 @@ def direct_booking_attempt(target: TargetBrowser, email: str) -> dict | None:
         # sub-resource fetches to stall on.
         target.page.reload(wait_until="commit", timeout=8000)
 
-        # The form/button may not be in the DOM the instant commit fires.
-        # Wait for the submit button to appear (state="attached" rather than
-        # "visible" — with CSS blocked the element is still interactable but
-        # Playwright's visibility heuristic might be overly cautious).
-        target.page.wait_for_selector(
-            "button[type='submit'], input[type='submit']",
-            state="attached",
-            timeout=5000,
-        )
+        # Lift resource blocking so checkout pages load normally. The one
+        # reload that matters (above) already benefited from the filter.
+        target.page.unroute("**/*", _block_non_essential)
 
+        # fire_cart_add uses get_by_role(...).click() which auto-waits for
+        # the button to be attached, visible, stable, and enabled — no
+        # separate wait_for_selector needed.
         log.info("Attempting direct cart-add for %s", sid)
         if not fire_cart_add(target.page):
             log.error("Direct cart-add failed for %s", sid)
