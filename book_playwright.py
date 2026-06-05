@@ -95,38 +95,22 @@ def cart_add_button_enabled(page) -> bool:
 # (complete_checkout from the previous patch stays as-is -- it's fine.)
 # ===========================================================================
 
-def fire_cart_add(page, timeout_ms: int = 10000) -> bool:
+def fire_cart_add(page, timeout_ms: int = 2500) -> bool:
     """
-    Click the cart-add button, then confirm the cart is committed by checking
-    the CURRENT page for pretix's success message. Caller should verify the
-    button is enabled via cart_add_button_enabled() first.
+    Click the cart-add button, then confirm the cart is committed.
 
-    Cart-add on this pretix instance is an inline update: the URL stays on
-    /redeem?... and the page re-renders to show "Die gewählten Produkte
-    wurden deinem Warenkorb hinzugefügt." plus the cart widget. There is NO
-    separate /cart/ page (it 404s). So we confirm by polling the current
-    page content, not by navigating anywhere.
-
-    Why confirm at all: at release-time load, the cart-add may take a moment
-    to commit. Confirming before we navigate to checkout avoids the
-    ?require_cookie=true bounce that happens when checkout/start fires against
-    an uncommitted cart.
-
-    IMPORTANT: this runs AFTER the click that claims the 5-minute hold, so it
-    does NOT slow the competitive part of the strike. By the time we're here,
-    the slot is already ours for 5 minutes.
-
-    Returns True once the cart is confirmed (or after the click if confirmation
-    times out -- complete_checkout has its own retry backstop).
+    This is optimized for direct-strike use:
+    - short click timeout because the strike script assumes availability
+    - no repeated reload spam immediately after the click
+    - one fallback reload if the confirmation marker is not visible
     """
-    CART_CONFIRM_TIMEOUT_S = 5.0
-    CART_POLL_INTERVAL_S = 0.3
+    CART_CONFIRM_TIMEOUT_S = 2.0
+    CART_POLL_INTERVAL_S = 0.15
 
-    # Strings that indicate a committed cart on the current page.
     CONFIRM_MARKERS = (
-        "deinem warenkorb hinzugefügt",   # "...added to your cart"
-        "dein warenkorb",                  # cart widget heading
-        "minuten für dich reserviert",     # the hold-timer text
+        "deinem warenkorb hinzugefügt",
+        "dein warenkorb",
+        "minuten für dich reserviert",
     )
 
     try:
@@ -137,33 +121,41 @@ def fire_cart_add(page, timeout_ms: int = 10000) -> bool:
         log.error("Cart-add click failed: %s", e)
         return False
 
-    # Confirm the cart committed by polling the CURRENT page content.
-    # No navigation -- cart-add is an inline re-render.
+    # Let the inline/server-rendered response settle. This is after the
+    # competitive click, so it does not slow the actual claim.
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=3000)
+    except Exception:
+        pass
+
     deadline = time.time() + CART_CONFIRM_TIMEOUT_S
-    confirmed = False
+
     while time.time() < deadline:
         try:
             content = page.content().lower()
             if any(marker in content for marker in CONFIRM_MARKERS):
-                confirmed = True
-                break
+                log.info("Cart commit confirmed on page")
+                return True
         except Exception as e:
             log.warning("Cart-confirm read error: %s", e)
+
         time.sleep(CART_POLL_INTERVAL_S)
-        # The page may still be settling after the click; a light reload
-        # ensures we see the committed state. Only reload if not yet confirmed.
-        try:
-            page.reload(wait_until="domcontentloaded", timeout=8000)
-        except Exception:
-            pass
 
-    if confirmed:
-        log.info("Cart commit confirmed on page")
-    else:
-        log.warning("Cart commit not confirmed within %.1fs; proceeding to "
-                    "checkout anyway (checkout has its own retry)",
-                    CART_CONFIRM_TIMEOUT_S)
+    # One fallback reload, not repeated reloads.
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=5000)
+        content = page.content().lower()
+        if any(marker in content for marker in CONFIRM_MARKERS):
+            log.info("Cart commit confirmed after fallback reload")
+            return True
+    except Exception as e:
+        log.warning("Cart-confirm fallback reload failed: %s", e)
 
+    log.warning(
+        "Cart commit not confirmed within %.1fs; proceeding to checkout anyway "
+        "(checkout has its own retry)",
+        CART_CONFIRM_TIMEOUT_S,
+    )
     return True
 # ===========================================================================
 # REPLACE the existing complete_checkout function in book_playwright.py
