@@ -105,41 +105,52 @@ def cart_add_button_enabled(page: Page) -> bool:
 # Cart add
 # ---------------------------------------------------------------------------
 
-def fire_cart_add(page: Page, timeout_ms: int = 1500) -> bool:
+def fire_cart_add(page: Page, timeout_ms: int = 3500) -> bool:
     """
-    Click the cart-add button and return once pretix's async cart-add flow
-    has visibly started.
+    Click the cart-add button.
 
-    pretix handles cart-add through an AJAX POST followed by async navigation
-    to /cart/add?... and often then /?require_cookie=true. We do not poll
-    page.content() here because the page may be actively navigating.
+    pretix may render #btn-add-to-cart disabled briefly until its JS initializes
+    the selected product checkbox/form state. We wait for the selected product
+    input first, then for the button to become enabled, then click via the stable
+    button id.
 
-    Returns True once the click succeeds and the flow appears to start.
-    complete_checkout() remains the backstop: if the cart was not actually
-    committed, checkout/start will fail or bounce and retry.
+    This avoids the slower accessibility role lookup while keeping the flow
+    reliable.
     """
     try:
-        page.locator("#btn-add-to-cart").click(timeout=timeout_ms)
+        # The actual selected product in the rendered form, e.g. item_8=1.
+        page.locator('form[action*="/cart/add"] input[name^="item_"]:checked').first.wait_for(
+            state="attached",
+            timeout=timeout_ms,
+        )
+
+        btn = page.locator("#btn-add-to-cart").first
+
+        # Wait until pretix JS has enabled the submit button.
+        page.wait_for_function(
+            """
+            () => {
+              const btn = document.querySelector("#btn-add-to-cart");
+              return btn && !btn.disabled;
+            }
+            """,
+            timeout=timeout_ms,
+        )
+
+        btn.click(timeout=timeout_ms)
+
     except Exception as e:
         log.error("Cart-add click failed: %s", e)
         return False
 
-    # Optional lightweight confirmation: wait only for the async flow to begin.
-    # Do not require this to succeed; the click itself is the competitive action.
+    # Do not read page.content() here; pretix may be navigating through the
+    # async cart-add flow, which can race with content reads.
     try:
-        page.wait_for_url(
-            lambda url: "/cart/add" in url or "require_cookie=true" in url,
-            timeout=2000,
-        )
-        log.info("Cart-add async flow observed: %s", page.url)
+        page.wait_for_load_state("domcontentloaded", timeout=2000)
     except Exception:
-        log.warning(
-            "Cart-add click sent, but async flow URL was not observed within timeout; "
-            "proceeding to checkout anyway"
-        )
+        pass
 
     return True
-
 # ---------------------------------------------------------------------------
 # Checkout
 # ---------------------------------------------------------------------------
