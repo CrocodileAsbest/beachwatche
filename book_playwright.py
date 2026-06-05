@@ -95,17 +95,158 @@ def cart_add_button_enabled(page) -> bool:
 # (complete_checkout from the previous patch stays as-is -- it's fine.)
 # ===========================================================================
 
-def fire_cart_add(page, timeout_ms: int = 2500) -> bool:
-    """
-    Click the cart-add button, then confirm the cart is committed.
+from urllib.parse import parse_qsl
 
-    This is optimized for direct-strike use:
-    - short click timeout because the strike script assumes availability
-    - no repeated reload spam immediately after the click
-    - one fallback reload if the confirmation marker is not visible
+
+SENSITIVE_FIELD_HINTS = (
+    "voucher",
+    "csrf",
+    "token",
+    "secret",
+    "password",
+)
+
+
+def _redact_form_value(name: str, value: str) -> str:
+    lower = name.lower()
+    if any(hint in lower for hint in SENSITIVE_FIELD_HINTS):
+        if not value:
+            return ""
+        return f"<redacted:{len(value)} chars>"
+    return value
+
+
+def log_cart_add_form(page: Page) -> None:
     """
-    CART_CONFIRM_TIMEOUT_S = 2.0
-    CART_POLL_INTERVAL_S = 0.15
+    Log the rendered cart-add form before clicking.
+
+    This helps you inspect the exact POST action and form fields pretix expects.
+    Sensitive-looking fields are redacted.
+    """
+    try:
+        form_info = page.evaluate(
+            """
+            () => {
+              const button = [...document.querySelectorAll("button")]
+                .find(b => (b.textContent || "").includes("Zum Warenkorb hinzufügen"));
+
+              if (!button) {
+                return { found: false, reason: "cart-add button not found" };
+              }
+
+              const form = button.closest("form");
+              if (!form) {
+                return { found: false, reason: "button has no parent form" };
+              }
+
+              const fields = [];
+              for (const el of form.querySelectorAll("input, select, textarea, button")) {
+                const name = el.getAttribute("name") || "";
+                if (!name) continue;
+
+                let value = "";
+                if (el.tagName === "SELECT") {
+                  value = el.value || "";
+                } else if (el.type === "checkbox" || el.type === "radio") {
+                  if (!el.checked) continue;
+                  value = el.value || "on";
+                } else {
+                  value = el.value || "";
+                }
+
+                fields.push({
+                  tag: el.tagName.toLowerCase(),
+                  type: el.getAttribute("type") || "",
+                  name,
+                  value,
+                });
+              }
+
+              return {
+                found: true,
+                action: form.action,
+                method: form.method,
+                field_count: fields.length,
+                fields,
+              };
+            }
+            """
+        )
+
+        if not form_info.get("found"):
+            log.warning("Cart-add form not found: %s", form_info)
+            return
+
+        log.info(
+            "Cart-add form: method=%s action=%s fields=%d",
+            form_info.get("method"),
+            form_info.get("action"),
+            form_info.get("field_count"),
+        )
+
+        for field in form_info.get("fields", []):
+            name = field.get("name", "")
+            value = _redact_form_value(name, field.get("value", ""))
+            log.info(
+                "Cart-add form field: <%s type=%s> %s=%r",
+                field.get("tag"),
+                field.get("type"),
+                name,
+                value,
+            )
+
+    except Exception as e:
+        log.warning("Could not log cart-add form: %s", e)
+
+def arm_cart_add_request_logger(page: Page) -> None:
+    """
+    Log the actual POST request sent by the cart-add click.
+
+    This captures what Playwright really submitted, not just what was present
+    in the DOM before clicking.
+    """
+    def _on_request(request):
+        try:
+            if request.method != "POST":
+                return
+
+            url = request.url
+            post_data = request.post_data or ""
+
+            # Keep this broad enough to catch pretix cart/redeem submissions.
+            if "cart" not in url and "redeem" not in url and "buchung-beachplatz" not in url:
+                return
+
+            log.info("Outgoing POST: %s", url)
+
+            content_type = request.headers.get("content-type", "")
+            log.info("Outgoing POST content-type: %s", content_type)
+
+            if post_data:
+                for key, value in parse_qsl(post_data, keep_blank_values=True):
+                    log.info(
+                        "Outgoing POST field: %s=%r",
+                        key,
+                        _redact_form_value(key, value),
+                    )
+            else:
+                log.info("Outgoing POST had no readable post_data")
+
+        except Exception as e:
+            log.warning("Could not inspect outgoing request: %s", e)
+
+    page.on("request", _on_request)
+
+
+
+CART_ADD_SELECTOR = 'button:has-text("Zum Warenkorb hinzufügen")'
+
+def fire_cart_add(page, timeout_ms: int = 1500) -> bool:
+    CART_CONFIRM_TIMEOUT_S = 1.5
+    CART_POLL_INTERVAL_S = 0.1
+
+    log_cart_add_form(page)
+    arm_cart_add_request_logger(page)
 
     CONFIRM_MARKERS = (
         "deinem warenkorb hinzugefügt",
@@ -114,22 +255,12 @@ def fire_cart_add(page, timeout_ms: int = 2500) -> bool:
     )
 
     try:
-        page.get_by_role(
-            "button", name="Zum Warenkorb hinzufügen"
-        ).first.click(timeout=timeout_ms)
+        page.locator(CART_ADD_SELECTOR).first.click(timeout=timeout_ms)
     except Exception as e:
         log.error("Cart-add click failed: %s", e)
         return False
 
-    # Let the inline/server-rendered response settle. This is after the
-    # competitive click, so it does not slow the actual claim.
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=3000)
-    except Exception:
-        pass
-
     deadline = time.time() + CART_CONFIRM_TIMEOUT_S
-
     while time.time() < deadline:
         try:
             content = page.content().lower()
@@ -141,9 +272,9 @@ def fire_cart_add(page, timeout_ms: int = 2500) -> bool:
 
         time.sleep(CART_POLL_INTERVAL_S)
 
-    # One fallback reload, not repeated reloads.
+    # One fallback reload only, not repeated reloads.
     try:
-        page.reload(wait_until="domcontentloaded", timeout=5000)
+        page.reload(wait_until="domcontentloaded", timeout=3000)
         content = page.content().lower()
         if any(marker in content for marker in CONFIRM_MARKERS):
             log.info("Cart commit confirmed after fallback reload")
@@ -152,11 +283,12 @@ def fire_cart_add(page, timeout_ms: int = 2500) -> bool:
         log.warning("Cart-confirm fallback reload failed: %s", e)
 
     log.warning(
-        "Cart commit not confirmed within %.1fs; proceeding to checkout anyway "
-        "(checkout has its own retry)",
+        "Cart commit not confirmed within %.1fs; proceeding to checkout anyway",
         CART_CONFIRM_TIMEOUT_S,
     )
     return True
+
+
 # ===========================================================================
 # REPLACE the existing complete_checkout function in book_playwright.py
 # with this.
