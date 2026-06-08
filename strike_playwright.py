@@ -160,7 +160,7 @@ def sleep_until(target_utc: datetime, label: str, warn_if_more_than_s: int = 600
 # ---------------------------------------------------------------------------
 
 def bookings_today(state: dict) -> int:
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(BERLIN_TZ).strftime("%Y-%m-%d")
     return sum(
         1 for e in state.get("booking_log", [])
         if e.get("booked_at", "").startswith(today)
@@ -271,6 +271,10 @@ def arm_resource_blocking(target: TargetBrowser) -> None:
     Call this AFTER prewarm completes (so the initial page load fetches
     everything it needs) but BEFORE the strike reload, so the reload only
     transfers HTML + JS — no images, CSS, fonts, or media.
+
+    NOTE: the unroute call in direct_booking_attempt references this same
+    _block_non_essential function object by identity. Do not replace it with
+    a lambda or local closure, or unroute will silently fail to match.
     """
     target.page.route("**/*", _block_non_essential)
     log.info("Resource blocking armed for %s", target.slot["slot_id"])
@@ -288,16 +292,15 @@ def direct_booking_attempt(target: TargetBrowser, email: str) -> tuple[dict | No
     deadline = time.monotonic() + STRIKE_RETRY_WINDOW_SECONDS
     attempt = 0
     cart_was_added = False
-    resource_blocking_active = True
 
     try:
+        # Resource blocking stays active for ALL retry reloads. The fetch-based
+        # fire_cart_add only needs the HTML form in the DOM — no CSS, images,
+        # fonts, or media. Blocking them saves bandwidth on every retry.
         while time.monotonic() < deadline and not cart_was_added:
             attempt += 1
 
             try:
-                # Wait for DOMContentLoaded, not just commit. The competitive
-                # cart-add path needs the server-rendered form/button to exist
-                # in the DOM. A commit-only reload can return before parsing.
                 target.page.reload(wait_until="domcontentloaded", timeout=3000)
             except Exception as e:
                 log.warning(
@@ -308,16 +311,6 @@ def direct_booking_attempt(target: TargetBrowser, email: str) -> tuple[dict | No
                 )
                 time.sleep(STRIKE_RETRY_SLEEP_SECONDS)
                 continue
-
-            # The strike reload has now had its benefit. Let checkout and any
-            # follow-up pages load normally. Calling unroute repeatedly can
-            # raise if already removed, so guard it.
-            if resource_blocking_active:
-                try:
-                    target.page.unroute("**/*", _block_non_essential)
-                except Exception:
-                    pass
-                resource_blocking_active = False
 
             try:
                 button_count = target.page.locator("#btn-add-to-cart").count()
@@ -344,6 +337,13 @@ def direct_booking_attempt(target: TargetBrowser, email: str) -> tuple[dict | No
             # a fresh server-rendered reload for a few seconds.
             time.sleep(STRIKE_RETRY_SLEEP_SECONDS)
 
+        # Lift resource blocking now that the retry loop is done. Checkout
+        # pages need full resources (CSS for visibility checks, etc.).
+        try:
+            target.page.unroute("**/*", _block_non_essential)
+        except Exception:
+            pass
+
         if not cart_was_added:
             log.error(
                 "Direct cart-add failed for %s after %d attempt(s)",
@@ -365,7 +365,7 @@ def direct_booking_attempt(target: TargetBrowser, email: str) -> tuple[dict | No
             ),
             "slot_url": target.slot["url"],
             "order_url": order_url,
-            "booked_at": datetime.now().isoformat(timespec="seconds"),
+            "booked_at": datetime.now(BERLIN_TZ).isoformat(timespec="seconds"),
         }
         return winner, True
 
@@ -511,7 +511,7 @@ def strike() -> int:
                 return 0
 
             record_booking(state, winner)
-            state["last_run"] = datetime.now().isoformat(timespec="seconds")
+            state["last_run"] = datetime.now(BERLIN_TZ).isoformat(timespec="seconds")
             state.pop("active_hold", None)
             save_state(state)
 
