@@ -63,6 +63,13 @@ STRIKE_HOURS = (17, 20)
 # Wake up this many seconds before the real release boundary.
 PRE_STRIKE_WAKE_SECONDS = 1
 
+# After the release boundary, keep trying fresh server-rendered reloads for a
+# short burst. This protects against small release/server clock jitter where the
+# first 17:00:00 reload still returns the pre-release page without a cart button.
+STRIKE_RETRY_WINDOW_SECONDS = 5.0
+STRIKE_RETRY_SLEEP_SECONDS = 0.18
+STRIKE_CART_ADD_TIMEOUT_MS = 1200
+
 # Daily booking cap.
 DAILY_BOOKING_LIMIT = 2
 
@@ -134,12 +141,11 @@ def sleep_until(target_utc: datetime, label: str, warn_if_more_than_s: int = 600
 
     if wait > warn_if_more_than_s:
         log.warning(
-            "%s is %.0fs away (>%.0fmin). Continuing now anyway.",
+            "%s is %.0fs away (>%.0fmin). Sleeping until target time anyway.",
             label,
             wait,
             warn_if_more_than_s / 60,
         )
-        return
 
     log.info(
         "Sleeping %.3fs until %s %s",
@@ -148,7 +154,6 @@ def sleep_until(target_utc: datetime, label: str, warn_if_more_than_s: int = 600
         target_utc.astimezone(BERLIN_TZ).isoformat(timespec="milliseconds"),
     )
     time.sleep(wait)
-
 
 # ---------------------------------------------------------------------------
 # Booking limit helpers
@@ -271,40 +276,88 @@ def arm_resource_blocking(target: TargetBrowser) -> None:
     log.info("Resource blocking armed for %s", target.slot["slot_id"])
 
 
-def direct_booking_attempt(target: TargetBrowser, email: str) -> dict | None:
+def direct_booking_attempt(target: TargetBrowser, email: str) -> tuple[dict | None, bool]:
     """
-    Reload once at release time, click cart-add immediately, then checkout.
-    Returns winner dict on success, None on failure.
+    Try direct cart-add for a short post-release window, then checkout.
+
+    Returns (winner, cart_was_added). cart_was_added is True once fire_cart_add()
+    has succeeded, even if checkout later fails. The caller should stop on that
+    case to avoid creating multiple concurrent holds.
     """
     sid = target.slot["slot_id"]
+    deadline = time.monotonic() + STRIKE_RETRY_WINDOW_SECONDS
+    attempt = 0
+    cart_was_added = False
+    resource_blocking_active = True
 
     try:
-        # "commit" fires as soon as the browser receives the first response
-        # bytes from the server — before full HTML parsing completes.
-        # Combined with the resource-blocking route (armed earlier), the DOM
-        # is ready almost instantly after commit because there are no
-        # sub-resource fetches to stall on.
-        target.page.reload(wait_until="commit", timeout=8000)
+        while time.monotonic() < deadline and not cart_was_added:
+            attempt += 1
 
-        # Lift resource blocking so checkout pages load normally. The one
-        # reload that matters (above) already benefited from the filter.
-        target.page.unroute("**/*", _block_non_essential)
+            try:
+                # Wait for DOMContentLoaded, not just commit. The competitive
+                # cart-add path needs the server-rendered form/button to exist
+                # in the DOM. A commit-only reload can return before parsing.
+                target.page.reload(wait_until="domcontentloaded", timeout=3000)
+            except Exception as e:
+                log.warning(
+                    "Strike reload failed for %s attempt %d: %s",
+                    sid,
+                    attempt,
+                    e,
+                )
+                time.sleep(STRIKE_RETRY_SLEEP_SECONDS)
+                continue
 
-        # fire_cart_add uses get_by_role(...).click() which auto-waits for
-        # the button to be attached, visible, stable, and enabled — no
-        # separate wait_for_selector needed.
-        log.info("Attempting direct cart-add for %s", sid)
-        if not fire_cart_add(target.page):
-            log.error("Direct cart-add failed for %s", sid)
-            return None
+            # The strike reload has now had its benefit. Let checkout and any
+            # follow-up pages load normally. Calling unroute repeatedly can
+            # raise if already removed, so guard it.
+            if resource_blocking_active:
+                try:
+                    target.page.unroute("**/*", _block_non_essential)
+                except Exception:
+                    pass
+                resource_blocking_active = False
 
-        log.info("Cart added for %s, proceeding to checkout", sid)
+            try:
+                button_count = target.page.locator("#btn-add-to-cart").count()
+            except Exception:
+                button_count = -1
+            log.info(
+                "Post-reload cart button count for %s attempt %d: %s",
+                sid,
+                attempt,
+                button_count,
+            )
+
+            log.info("Attempting direct cart-add for %s attempt %d", sid, attempt)
+            if fire_cart_add(target.page, timeout_ms=STRIKE_CART_ADD_TIMEOUT_MS):
+                cart_was_added = True
+                log.info(
+                    "Cart added for %s on attempt %d, proceeding to checkout",
+                    sid,
+                    attempt,
+                )
+                break
+
+            # If the release page did not yet contain the form/button, retry with
+            # a fresh server-rendered reload for a few seconds.
+            time.sleep(STRIKE_RETRY_SLEEP_SECONDS)
+
+        if not cart_was_added:
+            log.error(
+                "Direct cart-add failed for %s after %d attempt(s)",
+                sid,
+                attempt,
+            )
+            return None, False
+
         order_url = complete_checkout(target.page, email)
         if not order_url:
             log.error("Checkout failed for %s after cart-add", sid)
-            return None
+            return None, True
 
-        return {
+        winner = {
             "slot_id": sid,
             "description": (
                 f"{target.slot['weekday']} {target.slot['date']} "
@@ -314,11 +367,11 @@ def direct_booking_attempt(target: TargetBrowser, email: str) -> dict | None:
             "order_url": order_url,
             "booked_at": datetime.now().isoformat(timespec="seconds"),
         }
+        return winner, True
 
     except Exception as e:
         log.error("Booking exception for %s: %s", sid, e)
-        return None
-
+        return None, cart_was_added
 
 # ---------------------------------------------------------------------------
 # Main
@@ -416,14 +469,23 @@ def strike() -> int:
             winner: dict | None = None
             attempts_per_target = {t.slot["slot_id"]: 0 for t in targets}
 
-            # Single pass: no detect/poll loop. Try each target once, in order,
-            # and stop immediately on first successful booking.
+            # Try each target in order. Each target gets a short post-release
+            # retry burst inside direct_booking_attempt() to handle release jitter.
+            # Stop immediately on success. If a cart was added but checkout failed,
+            # also stop to avoid creating multiple concurrent holds.
             for target in targets:
                 sid = target.slot["slot_id"]
                 attempts_per_target[sid] += 1
 
-                winner = direct_booking_attempt(target, email)
+                winner, cart_was_added = direct_booking_attempt(target, email)
                 if winner:
+                    break
+
+                if cart_was_added:
+                    log.error(
+                        "Cart was added but checkout failed for %s; stopping to avoid double-hold.",
+                        sid,
+                    )
                     break
 
             # Cleanup all contexts
