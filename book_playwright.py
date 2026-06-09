@@ -178,8 +178,10 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
                 const type = (el.getAttribute("type") || "").toLowerCase();
 
                 if (type === "checkbox" || type === "radio") {
-                  if (!el.hasAttribute("checked")) continue;
+                  if (el.hasAttribute("checked") || name.startsWith("item_")) {
                   params.append(name, el.getAttribute("value") || "on");
+                  }
+                  continue;
                 } else if (el.tagName === "SELECT") {
                   const selected = el.querySelector("option[selected]");
                   params.append(name, selected ? selected.getAttribute("value") || "" : "");
