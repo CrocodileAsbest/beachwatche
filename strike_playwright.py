@@ -4,13 +4,13 @@ strike_playwright.py
 
 Browser-driven direct strike script. Pre-warms one Playwright browser context
 per target slot to the redeem page, wakes up 1 second before the real release
-boundary (17:00 or 20:00 Berlin), then at the exact release boundary reloads
-once and immediately clicks "Zum Warenkorb hinzufügen".
+boundary (17:00 or 20:00 Berlin), then at the exact release boundary calls
+fire_cart_add() which fetches fresh server HTML, parses it without rendering,
+and POSTs the cart-add form — all inside a single page.evaluate().
 
 This version intentionally skips the repeated detect/poll loop. It assumes the
-slot is available at the release boundary, while still doing the one required
-reload because pretix pages are server-rendered: a pre-warmed page from before
-release will not automatically show the cart-add button.
+slot is available at the release boundary, with a short retry burst to handle
+minor server clock jitter.
 
 Strike-hour-aware target filtering:
 - The 17:00 strike targets only Feld 1 slots.
@@ -20,7 +20,7 @@ Hard guardrails:
 - Single concurrent booking (loop breaks on first success)
 - Daily booking limit (DAILY_BOOKING_LIMIT, default 2)
 - Weekday exclusion (EXCLUDED_WEEKDAYS): Wed and Fri reserved for non-bot users
-- Wake 1 second early, then click only at the exact release boundary
+- Wake 1 second early, then fire only at the exact release boundary
 """
 
 from __future__ import annotations
@@ -63,12 +63,16 @@ STRIKE_HOURS = (17, 20)
 # Wake up this many seconds before the real release boundary.
 PRE_STRIKE_WAKE_SECONDS = 1
 
-# After the release boundary, keep trying fresh server-rendered reloads for a
-# short burst. This protects against small release/server clock jitter where the
-# first 17:00:00 reload still returns the pre-release page without a cart button.
+# After the release boundary, keep retrying fire_cart_add for a short burst.
+# This handles small release/server clock jitter where the first fetch-reload
+# still returns pre-release HTML without a cart button.
 STRIKE_RETRY_WINDOW_SECONDS = 5.0
 STRIKE_RETRY_SLEEP_SECONDS = 0.18
-STRIKE_CART_ADD_TIMEOUT_MS = 1200
+
+# Timeout for each fire_cart_add call. This now covers the fetch-reload +
+# DOMParser + POST + async poll, so it needs more headroom than a click-only
+# timeout. 2500ms allows ~200ms fetch + ~200ms POST + ~2000ms poll budget.
+STRIKE_CART_ADD_TIMEOUT_MS = 2500
 
 # Daily booking cap.
 DAILY_BOOKING_LIMIT = 2
@@ -82,9 +86,9 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 )
 
-# Resource types to block during the strike reload. Only the HTML (and the
-# JS needed for the form) matters for cart-add; images, CSS, fonts, and media
-# just waste bandwidth and parsing time.
+# Resource types to block during browser reloads. The primary fetch-based
+# path does not trigger browser reloads, so this only activates if the
+# click-based fallback fires. Kept as a safety net.
 BLOCKED_RESOURCE_TYPES = frozenset({"image", "stylesheet", "font", "media"})
 
 
@@ -268,9 +272,9 @@ def arm_resource_blocking(target: TargetBrowser) -> None:
     """
     Install the resource-blocking route handler on a pre-warmed page.
 
-    Call this AFTER prewarm completes (so the initial page load fetches
-    everything it needs) but BEFORE the strike reload, so the reload only
-    transfers HTML + JS — no images, CSS, fonts, or media.
+    The primary fetch-based cart-add path does NOT trigger browser reloads,
+    so this filter has no effect on the happy path. It exists as a safety
+    net for the click-based fallback, which does a browser reload.
 
     NOTE: the unroute call in direct_booking_attempt references this same
     _block_non_essential function object by identity. Do not replace it with
@@ -282,11 +286,14 @@ def arm_resource_blocking(target: TargetBrowser) -> None:
 
 def direct_booking_attempt(target: TargetBrowser, email: str) -> tuple[dict | None, bool]:
     """
-    Try direct cart-add for a short post-release window, then checkout.
+    Try fire_cart_add for a short post-release window, then checkout.
 
-    Returns (winner, cart_was_added). cart_was_added is True once fire_cart_add()
-    has succeeded, even if checkout later fails. The caller should stop on that
-    case to avoid creating multiple concurrent holds.
+    fire_cart_add handles the reload internally (fetch + DOMParser in a
+    single evaluate), so this function does NOT call page.reload().
+
+    Returns (winner, cart_was_added). cart_was_added is True once
+    fire_cart_add() has succeeded, even if checkout later fails. The
+    caller should stop on that case to avoid creating multiple holds.
     """
     sid = target.slot["slot_id"]
     deadline = time.monotonic() + STRIKE_RETRY_WINDOW_SECONDS
@@ -294,36 +301,10 @@ def direct_booking_attempt(target: TargetBrowser, email: str) -> tuple[dict | No
     cart_was_added = False
 
     try:
-        # Resource blocking stays active for ALL retry reloads. The fetch-based
-        # fire_cart_add only needs the HTML form in the DOM — no CSS, images,
-        # fonts, or media. Blocking them saves bandwidth on every retry.
         while time.monotonic() < deadline and not cart_was_added:
             attempt += 1
+            log.info("Attempting cart-add for %s attempt %d", sid, attempt)
 
-            try:
-                target.page.reload(wait_until="domcontentloaded", timeout=3000)
-            except Exception as e:
-                log.warning(
-                    "Strike reload failed for %s attempt %d: %s",
-                    sid,
-                    attempt,
-                    e,
-                )
-                time.sleep(STRIKE_RETRY_SLEEP_SECONDS)
-                continue
-
-            try:
-                button_count = target.page.locator("#btn-add-to-cart").count()
-            except Exception:
-                button_count = -1
-            log.info(
-                "Post-reload cart button count for %s attempt %d: %s",
-                sid,
-                attempt,
-                button_count,
-            )
-
-            log.info("Attempting direct cart-add for %s attempt %d", sid, attempt)
             if fire_cart_add(target.page, timeout_ms=STRIKE_CART_ADD_TIMEOUT_MS):
                 cart_was_added = True
                 log.info(
@@ -333,12 +314,13 @@ def direct_booking_attempt(target: TargetBrowser, email: str) -> tuple[dict | No
                 )
                 break
 
-            # If the release page did not yet contain the form/button, retry with
-            # a fresh server-rendered reload for a few seconds.
+            # fire_cart_add returned False → slot not yet released in HTML.
+            # Wait briefly, then retry with another fetch-reload.
             time.sleep(STRIKE_RETRY_SLEEP_SECONDS)
 
-        # Lift resource blocking now that the retry loop is done. Checkout
-        # pages need full resources (CSS for visibility checks, etc.).
+        # Lift resource blocking before checkout. On the happy path this is
+        # a no-op (fetch path never triggered browser reloads). On the
+        # click-fallback path it ensures checkout loads full resources.
         try:
             target.page.unroute("**/*", _block_non_essential)
         except Exception:
@@ -445,14 +427,13 @@ def strike() -> int:
                 log.error("No targets pre-warmed; exiting")
                 return 0
 
-            # Arm resource blocking on every pre-warmed page. This is done
-            # AFTER prewarm (which needs the full page) but BEFORE the strike
-            # reload, so the reload only fetches HTML + JS.
+            # Arm resource blocking as a safety net for the click-based
+            # fallback path. The primary fetch path is unaffected.
             for t in targets:
                 arm_resource_blocking(t)
 
-            # Wake 1 second early so setup is definitely done, but do not reload
-            # and click until the exact release boundary.
+            # Wake 1 second early so setup is definitely done, but do not
+            # fire until the exact release boundary.
             wake_utc = poll_start_time_utc(release_time_berlin)
             release_utc = release_time_berlin.astimezone(UTC_TZ)
             sleep_until(wake_utc, "pre-strike wake time")
@@ -470,9 +451,9 @@ def strike() -> int:
             attempts_per_target = {t.slot["slot_id"]: 0 for t in targets}
 
             # Try each target in order. Each target gets a short post-release
-            # retry burst inside direct_booking_attempt() to handle release jitter.
-            # Stop immediately on success. If a cart was added but checkout failed,
-            # also stop to avoid creating multiple concurrent holds.
+            # retry burst inside direct_booking_attempt() to handle jitter.
+            # Stop immediately on success. If a cart was added but checkout
+            # failed, also stop to avoid creating multiple concurrent holds.
             for target in targets:
                 sid = target.slot["slot_id"]
                 attempts_per_target[sid] += 1
