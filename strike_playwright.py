@@ -429,8 +429,8 @@ def strike() -> int:
 
             # Arm resource blocking as a safety net for the click-based
             # fallback path. The primary fetch path is unaffected.
-            for t in targets:
-                arm_resource_blocking(t)
+  #          for t in targets:
+   #             arm_resource_blocking(t)
 
             # Wake 1 second early so setup is definitely done, but do not
             # fire until the exact release boundary.
