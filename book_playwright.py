@@ -9,15 +9,17 @@ The flow:
   1. Visit listing page (establishes session)
   2. Visit slot detail page
   3. Fill voucher field, click "Gutschein einlösen"
-  4. Click "Zum Warenkorb hinzufügen" (cart-add)
+  4. Add slot to cart
   5. Navigate to /checkout/start (auto-redirects to questions)
   6. Fill email, click "Fortfahren"
   7. On confirm page: tick terms checkbox, click "Anmeldung abschicken"
   8. Wait for redirect to /order/.../
 
 Designed to be called from a strike script which has already pre-warmed
-a browser session up to step 4 (cart-add button may not yet be rendered
-before release).
+a browser session to the redeemed voucher page. At release time, fire_cart_add()
+fetches fresh server HTML, parses the cart-add form without rendering, POSTs it,
+polls pretix's async cart-add task, and then navigates the browser to the
+slot-specific require_cookie landing before checkout.
 """
 
 from __future__ import annotations
@@ -48,8 +50,7 @@ def prewarm_to_redeem(
     Steps 1-3: Land on the redeemed voucher page.
 
     Before release, pretix may not render the cart-add button at all. That is
-    fine: the strike script should call fire_cart_add() at release time, which
-    fetches fresh HTML internally.
+    fine: fire_cart_add() fetches fresh HTML internally at release time.
 
     Returns True on success, False on any failure.
     """
@@ -87,7 +88,7 @@ def cart_add_button_enabled(page: Page) -> bool:
 
     Reload the page and check if the cart-add button is present and enabled.
     The direct-strike script normally does not use this; it calls
-    fire_cart_add() which handles the reload internally.
+    fire_cart_add() which handles fresh HTML fetch internally.
     """
     try:
         page.reload(wait_until="domcontentloaded", timeout=8000)
@@ -101,24 +102,65 @@ def cart_add_button_enabled(page: Page) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Cart add helpers
+# ---------------------------------------------------------------------------
+
+def _navigate_to_require_cookie_landing(page: Page, timeout_ms: int = 5000) -> None:
+    """
+    After direct fetch cart-add, pretix still expects the browser to visit the
+    slot-specific landing URL with require_cookie=true before checkout/start.
+
+    Without this browser navigation, checkout/start can keep bouncing to the
+    event-level ?require_cookie=true page even though the cart-add async task
+    has completed.
+    """
+    try:
+        landing_url = page.evaluate(
+            """
+            () => {
+              const current = new URL(window.location.href);
+              const next = current.searchParams.get("next");
+
+              if (next) {
+                const url = new URL(next, window.location.origin);
+                url.searchParams.set("require_cookie", "true");
+                return url.toString();
+              }
+
+              // Fallback: if already on a slot/detail URL, add require_cookie.
+              const url = new URL(window.location.href);
+              url.searchParams.set("require_cookie", "true");
+              return url.toString();
+            }
+            """
+        )
+
+        log.info("Navigating to pretix require_cookie landing: %s", landing_url)
+        page.goto(landing_url, wait_until="domcontentloaded", timeout=timeout_ms)
+
+    except Exception as e:
+        log.warning("require_cookie landing navigation failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Cart add — primary path (fetch-reload + POST in single evaluate)
 # ---------------------------------------------------------------------------
 
 def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
     """
-    Fetch-reload + cart-add POST + async poll, all inside a single
-    page.evaluate() call. No browser reload or rendering needed.
+    Fetch-reload + cart-add POST + async poll, all inside a single page.evaluate()
+    call. No browser reload or rendering is needed for the primary path.
 
-    Instead of calling page.reload() (which triggers layout, paint, and
-    sub-resource fetches), this fetches the page HTML via fetch(), parses
-    it with DOMParser (no rendering), extracts the cart-add form fields,
-    and POSTs them — all in one JavaScript execution context with one
-    Playwright IPC round-trip.
+    Instead of calling page.reload(), this fetches the current redeem page HTML
+    via fetch(), parses it with DOMParser, extracts the cart-add form fields,
+    and POSTs them. After pretix reports the async cart-add as ready, this
+    function navigates the browser to the slot-specific require_cookie landing
+    so checkout/start can enter /checkout/questions/.
 
     Error classification:
-    - NO_CART_BUTTON/NO_CART_FORM: slot not yet released → return False
-      so the strike script can retry with another fetch-reload.
-    - POLL_TIMEOUT: cart may already be held server-side → return True,
+    - NO_CART_BUTTON/NO_CART_FORM: slot not yet released -> return False so
+      the strike script can retry with another fetch-reload.
+    - POLL_TIMEOUT: cart may already be held server-side -> return True and
       let complete_checkout() verify.
     - Other errors: fall back to browser reload + click-based approach.
     """
@@ -140,9 +182,8 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
                 return new URL(url, window.location.origin).toString();
               }
 
-              // ── Step 1: Fetch page HTML (replaces browser reload) ──────
-              // No layout, no paint, no sub-resource fetches. The browser
-              // sends session cookies automatically via same-origin.
+              // Step 1: Fetch page HTML. This replaces browser reload for the
+              // primary path and avoids layout, paint, and sub-resource fetches.
               const pageRes = await fetch(pageUrl, {
                 credentials: "same-origin",
                 headers: { "Accept": "text/html" },
@@ -152,9 +193,7 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
               }
               const html = await pageRes.text();
 
-              // ── Step 2: Parse HTML with DOMParser ──────────────────────
-              // Creates an inert document — no scripts execute, no images
-              // or CSS are fetched.
+              // Step 2: Parse inert HTML.
               const doc = new DOMParser().parseFromString(html, "text/html");
               const btn = doc.querySelector("#btn-add-to-cart");
               if (!btn) {
@@ -165,35 +204,44 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
                 throw new Error("NO_CART_FORM");
               }
 
-              // ── Step 3: Extract form fields ────────────────────────────
-              // Manual extraction rather than new FormData(form) because
-              // FormData on DOMParser documents may not pick up all fields
-              // reliably across engines. On an inert document el.value
-              // equals the value attribute, which is correct for server-
-              // rendered hidden inputs (CSRF, item IDs, voucher fields).
+              // Step 3: Extract form fields.
+              //
+              // Important: include pretix item_* checkboxes even if the inert
+              // HTML lacks a literal checked attribute. The normal live form may
+              // be effectively selected by browser/JS state; for cart-add we need
+              // the server-rendered item_* field in the POST.
               const params = new URLSearchParams();
               for (const el of form.querySelectorAll("input, select, textarea")) {
                 const name = el.getAttribute("name");
                 if (!name) continue;
+
+                const tag = el.tagName;
                 const type = (el.getAttribute("type") || "").toLowerCase();
 
                 if (type === "checkbox" || type === "radio") {
                   if (el.hasAttribute("checked") || name.startsWith("item_")) {
-                  params.append(name, el.getAttribute("value") || "on");
+                    params.append(name, el.getAttribute("value") || "on");
                   }
                   continue;
-                } else if (el.tagName === "SELECT") {
-                  const selected = el.querySelector("option[selected]");
-                  params.append(name, selected ? selected.getAttribute("value") || "" : "");
-                } else {
-                  params.append(name, el.getAttribute("value") || "");
                 }
+
+                if (tag === "SELECT") {
+                  const selected = el.querySelector("option[selected]");
+                  if (selected) {
+                    params.append(name, selected.getAttribute("value") || "");
+                  } else {
+                    const first = el.querySelector("option");
+                    params.append(name, first ? first.getAttribute("value") || "" : "");
+                  }
+                  continue;
+                }
+
+                params.append(name, el.getAttribute("value") || "");
               }
               params.set("ajax", "1");
 
-              // ── Step 4: POST cart-add ───────────────────────────────────
-              // Resolve the form action against the fetched page URL (not
-              // the pre-warm URL, in case they differ).
+              // Step 4: POST cart-add. Resolve action against fetched page URL,
+              // not the currently displayed prewarm URL.
               const formAction = new URL(
                 form.getAttribute("action") || "",
                 pageRes.url,
@@ -238,7 +286,7 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
                 throw new Error("POST_NO_CHECK_URL: " + postText.slice(0, 500));
               }
 
-              // ── Step 5: Poll async task ────────────────────────────────
+              // Step 5: Poll pretix async cart task.
               while (remaining() > 0) {
                 const checkRes = await fetch(checkUrl, {
                   method: "GET",
@@ -290,37 +338,40 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
 
         log.info("Fetch-reload cart-add phase: %s", result.get("phase"))
 
-        # If pretix returned a redirect, navigate there so the session
-        # reaches the expected post-cart-add state. Not strictly required
-        # (complete_checkout navigates to checkout/start directly), but
-        # may help pretix settle its cookie/session state.
+        # If pretix returned a redirect, follow it. Otherwise always perform the
+        # slot-specific require_cookie landing so checkout/start does not bounce.
         redirect = result.get("redirect")
         if redirect:
             if redirect.startswith("/"):
                 redirect = "https://tix.htw.stura-dresden.de" + redirect
             try:
+                log.info("Navigating to pretix cart-add redirect: %s", redirect)
                 page.goto(redirect, wait_until="domcontentloaded", timeout=5000)
             except Exception as e:
                 log.warning("Cart-add redirect navigation failed: %s", e)
+                _navigate_to_require_cookie_landing(page, timeout_ms=5000)
+        else:
+            _navigate_to_require_cookie_landing(page, timeout_ms=5000)
 
         return True
 
     except Exception as e:
         msg = str(e)
 
-        # Slot not yet released — return False so the caller can retry.
+        # Slot not yet released -> return False so the caller can retry quickly.
         if "NO_CART_BUTTON" in msg or "NO_CART_FORM" in msg:
-            log.warning("Fetch-reload: cart button not in HTML")
+            log.warning("Fetch-reload: cart button/form not in HTML")
             return False
 
-        # POST was sent, Celery task may already hold the slot. Proceeding
-        # to checkout is safer than retrying and risking a double-hold.
+        # POST was sent, async task may already hold the slot. Proceeding to
+        # checkout is safer than retrying and risking a double-hold.
         if "POLL_TIMEOUT" in msg:
             log.warning(
                 "Fetch-reload: async polling timed out; proceeding to "
                 "checkout because a cart hold may already exist: %s",
                 e,
             )
+            _navigate_to_require_cookie_landing(page, timeout_ms=5000)
             return True
 
         # Any other failure: fall back to proven browser reload + click.
@@ -340,9 +391,9 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
 
 def fire_cart_add_click_fallback(page: Page, timeout_ms: int = 2500) -> bool:
     """
-    Click-based cart-add fallback. Does a browser reload first (the
-    fetch-based primary path does not navigate, so the page DOM is stale),
-    then clicks the button and confirms.
+    Click-based cart-add fallback. Does a browser reload first because the
+    fetch-based primary path does not navigate/render fresh HTML into the live
+    page DOM, then clicks the button and confirms.
     """
     CART_CONFIRM_TIMEOUT_S = 1.5
     CART_POLL_INTERVAL_S = 0.1
@@ -353,8 +404,8 @@ def fire_cart_add_click_fallback(page: Page, timeout_ms: int = 2500) -> bool:
         "minuten für dich reserviert",
     )
 
-    # The fetch-based path didn't navigate, so the live DOM is still the
-    # pre-warm page. A real browser reload is needed for the click path.
+    # The fetch-based path did not update the live DOM. A real browser reload is
+    # needed for the click path.
     try:
         page.reload(wait_until="domcontentloaded", timeout=5000)
     except Exception as e:
@@ -415,8 +466,9 @@ def complete_checkout(page: Page, email: str, timeout_ms: int = 30000) -> str | 
     booking, wait for order page. Returns order URL on success.
 
     Robustness: pretix can bounce a freshly-carted session to
-    /?require_cookie=true at checkout/start. Visiting/retrying checkout/start
-    normally resolves that once the cart cookie/session is settled.
+    /?require_cookie=true at checkout/start. This should normally be solved by
+    fire_cart_add() navigating to the slot-specific require_cookie landing first.
+    The retry loop remains as a backstop.
     """
     CHECKOUT_START_RETRIES = 5
     RETRY_WAIT_S = 0.8
