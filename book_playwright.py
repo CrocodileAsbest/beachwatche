@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import logging
 import time
+from urllib.parse import quote, urljoin, urlparse
+
 from playwright.sync_api import Page, TimeoutError as PWTimeout
 
 log = logging.getLogger("book_pw")
@@ -68,6 +70,12 @@ def prewarm_to_redeem(
 
         page.get_by_role("button", name="Gutschein einlösen").click()
         page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+
+        # Diagnostic: does pretix establish a session cookie at redeem time?
+        # If yes, the strike's fetch POST reuses it and the cart binds to the
+        # checkout session. If no, that is the likely cause of the checkout
+        # require_cookie bounce.
+        _dump_session_cookies(page, f"prewarm-{slot_id}")
         return True
 
     except PWTimeout as e:
@@ -76,6 +84,180 @@ def prewarm_to_redeem(
     except Exception as e:
         log.error("Pre-warm error for %s: %s", slot_id, e)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Pre-built cart-add body (strike optimization)
+# ---------------------------------------------------------------------------
+
+def build_cart_post_body(
+    page: Page,
+    voucher: str,
+    subevent_id: str | None = None,
+    item_id: str | None = None,
+) -> dict | None:
+    """
+    Build the cart-add POST body at pre-warm time so the strike POST can skip
+    the HTML fetch + DOMParser round trip entirely.
+
+    Preferred source: the live cart-add form, if pretix already renders it on
+    the redeemed page. If the form is absent pre-release, a synthetic body is
+    constructed from the CSRF token plus the known voucher / item / subevent.
+    pretix's _items_from_post_data accepts item_<id>=1 together with
+    _voucher_code, so the synthetic body is equivalent to the form POST.
+
+    The synthetic path requires item_id (the pretix product ID, constant
+    across subevents -- read it once from a HAR or set CART_ITEM_ID).
+
+    Returns {"action": ..., "body": ..., "source": "form"|"synthetic"} or
+    None if neither source is available.
+    """
+    try:
+        # HAR-verified: the browser POSTs to cart/add?next=<subevent path>,
+        # which makes the success redirect land on the subevent's
+        # require_cookie page rather than the event index.
+        cart_add_url = f"{BASE_URL}cart/add"
+        if subevent_id:
+            event_path = urlparse(BASE_URL).path
+            cart_add_url += "?next=" + quote(f"{event_path}{subevent_id}/", safe="/")
+
+        result = page.evaluate(
+            """
+            ({ voucher, itemId, subevent, cartAddUrl }) => {
+              // Preferred: extract the real form from the live DOM.
+              const btn = document.querySelector("#btn-add-to-cart");
+              if (btn) {
+                const form = btn.closest("form");
+                if (form) {
+                  const params = new URLSearchParams();
+                  for (const el of form.querySelectorAll("input, select, textarea")) {
+                    const name = el.getAttribute("name");
+                    if (!name) continue;
+
+                    const tag = el.tagName;
+                    const type = (el.getAttribute("type") || "").toLowerCase();
+
+                    if (type === "checkbox" || type === "radio") {
+                      if (el.checked || el.hasAttribute("checked") || name.startsWith("item_")) {
+                        const fallback = name.startsWith("item_") ? "1" : "on";
+                        params.append(name, el.getAttribute("value") || fallback);
+                      }
+                      continue;
+                    }
+
+                    if (tag === "SELECT") {
+                      params.append(name, el.value || "");
+                      continue;
+                    }
+
+                    params.append(name, el.value || el.getAttribute("value") || "");
+                  }
+                  params.set("ajax", "1");
+                  if (voucher && !params.has("_voucher_code")) {
+                    params.set("_voucher_code", voucher);
+                  }
+                  const action = new URL(
+                    form.getAttribute("action") || "",
+                    window.location.href,
+                  ).toString();
+                  return { source: "form", action, body: params.toString() };
+                }
+              }
+
+              // Fallback: synthesize the body. Needs the product item ID.
+              if (!itemId) {
+                return { source: "none", reason: "NO_FORM_AND_NO_ITEM_ID" };
+              }
+
+              let csrf = null;
+              const csrfInput = document.querySelector(
+                'input[name="csrfmiddlewaretoken"]'
+              );
+              if (csrfInput) {
+                csrf = csrfInput.value;
+              }
+              if (!csrf) {
+                // Django >= 4.1 accepts the raw cookie secret as the token.
+                const m = document.cookie.match(
+                  /(?:^|;\\s*)(?:pretix_csrftoken|__Host-csrftoken|csrftoken)=([^;]+)/
+                );
+                if (m) csrf = decodeURIComponent(m[1]);
+              }
+              if (!csrf) {
+                return { source: "none", reason: "NO_CSRF_TOKEN" };
+              }
+
+              const params = new URLSearchParams();
+              params.set("csrfmiddlewaretoken", csrf);
+              params.set("_voucher_code", voucher);
+              params.set("item_" + itemId, "1");
+              if (subevent) {
+                params.set("subevent", String(subevent));
+              }
+              params.set("ajax", "1");
+              return {
+                source: "synthetic",
+                action: cartAddUrl,
+                body: params.toString(),
+              };
+            }
+            """,
+            {
+                "voucher": voucher,
+                "itemId": item_id,
+                "subevent": subevent_id,
+                "cartAddUrl": cart_add_url,
+            },
+        )
+
+        if result.get("source") == "none":
+            log.info(
+                "No prebuilt cart-add body available (%s); strike will use "
+                "fetch+parse path",
+                result.get("reason"),
+            )
+            return None
+
+        log.info(
+            "Prebuilt cart-add body ready (source=%s, action=%s)",
+            result.get("source"),
+            result.get("action"),
+        )
+        return result
+
+    except Exception as e:
+        log.warning("build_cart_post_body failed: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Connection warming (strike optimization)
+# ---------------------------------------------------------------------------
+
+def warm_connection(page: Page, timeout_ms: int = 800) -> None:
+    """
+    Refresh the browser's keep-alive connection to the pretix host shortly
+    before the strike so the cart-add POST does not pay TCP+TLS handshake
+    cost. The pre-warm happened minutes earlier; idle connections are
+    typically reaped by then. HEAD keeps the response body empty.
+    """
+    try:
+        page.evaluate(
+            """
+            async ({ timeoutMs }) => {
+              await fetch(window.location.href, {
+                method: "HEAD",
+                credentials: "same-origin",
+                cache: "no-store",
+                signal: AbortSignal.timeout(timeoutMs),
+              });
+            }
+            """,
+            {"timeoutMs": timeout_ms},
+        )
+        log.info("Connection warmed for %s", page.url)
+    except Exception as e:
+        log.warning("Connection warm failed (non-fatal): %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +286,69 @@ def cart_add_button_enabled(page: Page) -> bool:
 # ---------------------------------------------------------------------------
 # Cart add helpers
 # ---------------------------------------------------------------------------
+
+def _dump_session_cookies(page: Page, label: str) -> bool:
+    """
+    Log the pretix session/cart cookies currently in the browser context so a
+    failed checkout handshake is diagnosable from the systemd journal. Values
+    are redacted; only name/domain/path/secure/sameSite/httpOnly are shown.
+
+    Returns True if a pretix session cookie is present in the context.
+    """
+    try:
+        cookies = page.context.cookies()
+    except Exception as e:
+        log.warning("[%s] could not read context cookies: %s", label, e)
+        return False
+
+    has_session = False
+    for c in cookies:
+        name = c.get("name", "")
+        # pretix session cookie names vary by prefix config.
+        is_session = (
+            "session" in name.lower()
+            or name.endswith("pretix_session")
+            or "__Host-pretix" in name
+        )
+        if is_session:
+            has_session = True
+        log.info(
+            "[%s] cookie %s domain=%s path=%s secure=%s sameSite=%s httpOnly=%s",
+            label,
+            name,
+            c.get("domain"),
+            c.get("path"),
+            c.get("secure"),
+            c.get("sameSite"),
+            c.get("httpOnly"),
+        )
+
+    if not cookies:
+        log.warning("[%s] context has NO cookies", label)
+    elif not has_session:
+        log.warning("[%s] no pretix session cookie present in context", label)
+    return has_session
+
+
+def _settle_session(page: Page, timeout_ms: int = 5000) -> None:
+    """
+    Complete pretix's cookie handshake via a real top-level navigation.
+
+    The fast fetch() cart-add path can leave the session cookie un-adopted by
+    the browsing context (pretix treats AJAX /cart/add differently from a
+    normal navigation). Loading the event base as a real navigation lets
+    pretix set + verify its session cookie the same way the click-based flow
+    does, so the subsequent checkout/start sees the bound cart.
+    """
+    try:
+        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=timeout_ms)
+        # If pretix still wants a cookie test, follow it once so the param is
+        # consumed and the cookie round-trips.
+        if "require_cookie" in page.url:
+            page.goto(page.url, wait_until="domcontentloaded", timeout=timeout_ms)
+    except Exception as e:
+        log.warning("session settle navigation failed: %s", e)
+
 
 def _navigate_to_require_cookie_landing(page: Page, timeout_ms: int = 5000) -> None:
     """
@@ -146,20 +391,25 @@ def _navigate_to_require_cookie_landing(page: Page, timeout_ms: int = 5000) -> N
 # Cart add — primary path (fetch-reload + POST in single evaluate)
 # ---------------------------------------------------------------------------
 
-def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
+def fire_cart_add(page: Page, timeout_ms: int = 5000, prebuilt: dict | None = None) -> bool:
     """
-    Fetch-reload + cart-add POST + async poll, all inside a single page.evaluate()
-    call. No browser reload or rendering is needed for the primary path.
+    Cart-add POST + async poll, all inside a single page.evaluate() call.
+    No browser reload or rendering is needed for the primary path.
 
-    Instead of calling page.reload(), this fetches the current redeem page HTML
-    via fetch(), parses it with DOMParser, extracts the cart-add form fields,
-    and POSTs them. After pretix reports the async cart-add as ready, this
-    function navigates the browser to the slot-specific require_cookie landing
-    so checkout/start can enter /checkout/questions/.
+    If `prebuilt` ({"action": ..., "body": ...} from build_cart_post_body) is
+    given, the POST fires immediately with that body -- one network round trip.
+    Otherwise this fetches the current redeem page HTML via fetch(), parses it
+    with DOMParser, extracts the cart-add form fields, and POSTs them. After
+    pretix reports the async cart-add as ready, this function navigates the
+    browser to the slot-specific require_cookie landing so checkout/start can
+    enter /checkout/questions/.
 
     Error classification:
     - NO_CART_BUTTON/NO_CART_FORM: slot not yet released -> return False so
       the strike script can retry with another fetch-reload.
+    - CART_TASK_FAILED: pretix task ran but rejected the add (not yet
+      released, slot taken, voucher conflict) -> return False; nothing held.
+    - RELOAD_TIMEOUT: page fetch timed out before the POST -> return False.
     - POLL_TIMEOUT: cart may already be held server-side -> return True and
       let complete_checkout() verify.
     - Other errors: fall back to browser reload + click-based approach.
@@ -167,7 +417,7 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
     try:
         result = page.evaluate(
             """
-            async ({ pageUrl, timeoutMs }) => {
+            async ({ pageUrl, timeoutMs, prebuilt }) => {
               const startedAt = Date.now();
 
               function remaining() {
@@ -182,12 +432,38 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
                 return new URL(url, window.location.origin).toString();
               }
 
+              function fetchSignal() {
+                // Cap each network call at the remaining budget so a single
+                // hanging fetch cannot eat the whole strike retry window.
+                return AbortSignal.timeout(Math.max(50, remaining()));
+              }
+
+              let formAction;
+              let bodyString;
+
+              if (prebuilt && prebuilt.action && prebuilt.body) {
+                // Optimistic path: POST a body prebuilt at pre-warm time and
+                // skip the HTML fetch + DOMParser round trip entirely. pretix
+                // validates availability server-side in add_items_to_cart, so
+                // this succeeds the instant the quota opens. A too-early POST
+                // returns success:false -> CART_TASK_FAILED -> caller retries.
+                formAction = prebuilt.action;
+                bodyString = prebuilt.body;
+              } else {
+
               // Step 1: Fetch page HTML. This replaces browser reload for the
               // primary path and avoids layout, paint, and sub-resource fetches.
-              const pageRes = await fetch(pageUrl, {
-                credentials: "same-origin",
-                headers: { "Accept": "text/html" },
-              });
+              let pageRes;
+              try {
+                pageRes = await fetch(pageUrl, {
+                  credentials: "same-origin",
+                  headers: { "Accept": "text/html" },
+                  signal: fetchSignal(),
+                });
+              } catch (err) {
+                // Nothing was committed server-side yet -> safe to retry.
+                throw new Error("RELOAD_TIMEOUT: " + err);
+              }
               if (!pageRes.ok) {
                 throw new Error("RELOAD_HTTP_" + pageRes.status);
               }
@@ -220,7 +496,10 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
 
                 if (type === "checkbox" || type === "radio") {
                   if (el.hasAttribute("checked") || name.startsWith("item_")) {
-                    params.append(name, el.getAttribute("value") || "on");
+                    // pretix runs int() on item_* values server-side, so a
+                    // missing value must default to "1", never "on".
+                    const fallback = name.startsWith("item_") ? "1" : "on";
+                    params.append(name, el.getAttribute("value") || fallback);
                   }
                   continue;
                 }
@@ -239,18 +518,23 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
                 params.append(name, el.getAttribute("value") || "");
               }
               params.set("ajax", "1");
+              bodyString = params.toString();
 
-              // Step 4: POST cart-add. Resolve action against fetched page URL,
-              // not the currently displayed prewarm URL.
-              const formAction = new URL(
+              // Resolve action against the fetched page URL, not the
+              // currently displayed prewarm URL.
+              formAction = new URL(
                 form.getAttribute("action") || "",
                 pageRes.url,
               ).toString();
 
+              } // end fetch+parse branch
+
+              // Step 4: POST cart-add.
               const postRes = await fetch(formAction, {
                 method: "POST",
-                body: params.toString(),
+                body: bodyString,
                 credentials: "same-origin",
+                signal: fetchSignal(),
                 headers: {
                   "Content-Type": "application/x-www-form-urlencoded",
                   "X-Requested-With": "XMLHttpRequest",
@@ -267,6 +551,17 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
               }
               if (!postRes.ok) {
                 throw new Error("POST_HTTP_" + postRes.status + ": " + postText.slice(0, 300));
+              }
+
+              // pretix AsyncAction returns ready:true for BOTH success and
+              // failure, distinguished by the success flag. An empty-items /
+              // cart error also returns success:false (often redirect-only,
+              // no check_url). Treat any explicit success:false as a failed
+              // cart-add so the caller can move to the next target.
+              if (postJson.success === false) {
+                throw new Error(
+                  "CART_TASK_FAILED: " + (postJson.message || postText.slice(0, 300))
+                );
               }
 
               let lastJson = postJson;
@@ -291,6 +586,7 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
                 const checkRes = await fetch(checkUrl, {
                   method: "GET",
                   credentials: "same-origin",
+                  signal: fetchSignal(),
                   headers: {
                     "X-Requested-With": "XMLHttpRequest",
                     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -306,6 +602,14 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
                 }
 
                 lastJson = checkJson;
+
+                // Task finished but the cart-add failed (slot taken, voucher
+                // conflict). Do NOT proceed to checkout; let caller retry/next.
+                if (checkJson.ready === true && checkJson.success === false) {
+                  throw new Error(
+                    "CART_TASK_FAILED: " + (checkJson.message || checkText.slice(0, 300))
+                  );
+                }
 
                 if (checkJson.ready === true) {
                   return {
@@ -327,13 +631,13 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
                   checkUrl = absoluteUrl(checkJson.check_url);
                 }
 
-                await sleep(100);
+                await sleep(50);
               }
 
               throw new Error("POLL_TIMEOUT: lastJson=" + JSON.stringify(lastJson));
             }
             """,
-            {"pageUrl": page.url, "timeoutMs": timeout_ms},
+            {"pageUrl": page.url, "timeoutMs": timeout_ms, "prebuilt": prebuilt},
         )
 
         log.info("Fetch-reload cart-add phase: %s", result.get("phase"))
@@ -342,8 +646,7 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
         # slot-specific require_cookie landing so checkout/start does not bounce.
         redirect = result.get("redirect")
         if redirect:
-            if redirect.startswith("/"):
-                redirect = "https://tix.htw.stura-dresden.de" + redirect
+            redirect = urljoin(page.url, redirect)
             try:
                 log.info("Navigating to pretix cart-add redirect: %s", redirect)
                 page.goto(redirect, wait_until="domcontentloaded", timeout=5000)
@@ -353,6 +656,12 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
         else:
             _navigate_to_require_cookie_landing(page, timeout_ms=5000)
 
+        # Diagnostic: confirm the session cookie that binds the cart is now in
+        # the browsing context. If this logs a warning, the checkout bounce is
+        # a cookie-adoption problem (the fast fetch path did not establish the
+        # session the navigation uses).
+        _dump_session_cookies(page, "after-cart-add")
+
         return True
 
     except Exception as e:
@@ -361,6 +670,19 @@ def fire_cart_add(page: Page, timeout_ms: int = 5000) -> bool:
         # Slot not yet released -> return False so the caller can retry quickly.
         if "NO_CART_BUTTON" in msg or "NO_CART_FORM" in msg:
             log.warning("Fetch-reload: cart button/form not in HTML")
+            return False
+
+        # Initial page fetch timed out before anything was committed -> retry.
+        if "RELOAD_TIMEOUT" in msg:
+            log.warning("Fetch-reload: page fetch timed out before POST; retrying")
+            return False
+
+        # Task ran but the cart-add itself failed (slot taken, voucher
+        # conflict, empty items). Nothing is held, so return False to let the
+        # strike script retry this slot or move to the next target. Crucially
+        # do NOT fall through to checkout or the click fallback.
+        if "CART_TASK_FAILED" in msg:
+            log.warning("Fetch-reload: server reported cart-add failure: %s", e)
             return False
 
         # POST was sent, async task may already hold the slot. Proceeding to
@@ -470,8 +792,8 @@ def complete_checkout(page: Page, email: str, timeout_ms: int = 30000) -> str | 
     fire_cart_add() navigating to the slot-specific require_cookie landing first.
     The retry loop remains as a backstop.
     """
-    CHECKOUT_START_RETRIES = 5
-    RETRY_WAIT_S = 0.8
+    CHECKOUT_START_RETRIES = 6
+    RETRY_WAIT_S = 0.6
 
     try:
         # Step 5: navigate into checkout. Retry on require_cookie or other
@@ -491,19 +813,15 @@ def complete_checkout(page: Page, email: str, timeout_ms: int = 30000) -> str | 
             if "require_cookie" in page.url:
                 log.warning(
                     "checkout/start bounced to require_cookie "
-                    "(attempt %d/%d); retrying after %.1fs",
+                    "(attempt %d/%d); settling session and retrying",
                     attempt,
                     CHECKOUT_START_RETRIES,
-                    RETRY_WAIT_S,
                 )
-                try:
-                    page.goto(
-                        page.url,
-                        wait_until="domcontentloaded",
-                        timeout=timeout_ms,
-                    )
-                except Exception:
-                    pass
+                # Diagnose and repair: the fast fetch cart-add can leave the
+                # session cookie un-adopted. A real top-level navigation makes
+                # pretix establish + verify the cookie like the click path.
+                _dump_session_cookies(page, f"bounce-{attempt}")
+                _settle_session(page, timeout_ms=min(timeout_ms, 5000))
                 time.sleep(RETRY_WAIT_S)
                 continue
 
@@ -516,6 +834,7 @@ def complete_checkout(page: Page, email: str, timeout_ms: int = 30000) -> str | 
                 CHECKOUT_START_RETRIES,
                 page.url,
             )
+            _dump_session_cookies(page, "checkout-failed")
             return None
 
         # Step 6: submit email.
@@ -527,8 +846,14 @@ def complete_checkout(page: Page, email: str, timeout_ms: int = 30000) -> str | 
             log.error("Expected confirm page, got: %s", page.url)
             return None
 
-        # Step 7: tick terms checkbox and submit.
-        page.locator('input[type="checkbox"][name^="confirm_"]').first.check()
+        # Step 7: tick every confirmation checkbox (pretix may render more
+        # than one, e.g. terms + privacy) and submit.
+        confirm_boxes = page.locator('input[type="checkbox"][name^="confirm_"]')
+        n_boxes = confirm_boxes.count()
+        for i in range(n_boxes):
+            box = confirm_boxes.nth(i)
+            if not box.is_checked():
+                box.check()
         page.get_by_role("button", name="Anmeldung abschicken").first.click()
 
         # Step 8: wait for redirect to order page.
