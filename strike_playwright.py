@@ -3,10 +3,12 @@
 strike_playwright.py
 
 Browser-driven direct strike script. Pre-warms one Playwright browser context
-per target slot to the redeem page, wakes up 1 second before the real release
-boundary (17:00 or 20:00 Berlin), then at the exact release boundary calls
-fire_cart_add(), which fetches fresh server HTML, parses it without rendering,
-and POSTs the cart-add form.
+per target slot to the redeem page and prebuilds the cart-add POST body,
+wakes up shortly before the real release boundary (17:00 or 20:00 Berlin),
+measures the server clock offset and warms keep-alive connections, then at
+the (clock-adjusted) release boundary fires the prebuilt cart-add POST in a
+single network round trip. Falls back to fetch+DOMParser and finally to a
+browser reload+click if needed.
 
 This version skips the old repeated detect/poll loop, but uses a short
 post-release retry burst to handle minor server clock jitter.
@@ -19,7 +21,8 @@ Hard guardrails:
 - Single completed checkout only
 - Daily booking limit (DAILY_BOOKING_LIMIT, default 2)
 - Weekday exclusion (EXCLUDED_WEEKDAYS): Wed and Fri reserved for non-bot users
-- Wake 1 second early, then fire only at the exact release boundary
+- Wake a few seconds early for clock probe + warming, then fire only at the
+  (server-clock-adjusted) release boundary
 - If cart-add succeeds but checkout never enters the checkout flow and only
   bounces to require_cookie, allow trying the next target.
 - If checkout reaches the checkout flow and then fails, stop to avoid double-hold.
@@ -50,9 +53,12 @@ from beachplatz_watcher import (  # noqa: E402
     weeks_to_watch,
 )
 from book_playwright import (  # noqa: E402
+    BASE_URL,
+    build_cart_post_body,
     complete_checkout,
     fire_cart_add,
     prewarm_to_redeem,
+    warm_connection,
 )
 
 # ---------------------------------------------------------------------------
@@ -62,8 +68,26 @@ from book_playwright import (  # noqa: E402
 # Strike hours in Berlin time. Script aligns the final direct cart-add to these.
 STRIKE_HOURS = (17, 20)
 
-# Wake up this many seconds before the real release boundary.
-PRE_STRIKE_WAKE_SECONDS = 1
+# Wake up this many seconds before the real release boundary. The window is
+# used for (1) measuring the server clock offset and (2) warming keep-alive
+# connections, so it must fit both with margin.
+PRE_STRIKE_WAKE_SECONDS = 2.5
+
+# Server clock offset probe: budget and sanity clamp. If the measured offset
+# exceeds the clamp, it is treated as a measurement error and ignored.
+CLOCK_PROBE_BUDGET_S = 1.2
+MAX_CLOCK_ADJUST_S = 1.5
+
+# Number of initial fire_cart_add attempts that use the prebuilt POST body
+# (one network round trip). Later attempts fall back to fetch+parse, which is
+# slower but self-correcting: it reads the real released form from the server.
+PREBUILT_ATTEMPTS = 3
+
+# pretix product ID (constant across subevents). Enables the synthetic
+# prebuilt POST body even when the cart form is not rendered pre-release.
+# Verified from HAR capture 2026-06-05: POST body was exactly
+#   csrfmiddlewaretoken, subevent=<id>, _voucher_code, item_8=1, ajax=1
+CART_ITEM_ID = os.environ.get("CART_ITEM_ID") or "8"
 
 # After the release boundary, keep retrying fire_cart_add for a short burst.
 # This handles small release/server clock jitter where the first fetch-reload
@@ -122,11 +146,82 @@ def next_release_time_berlin() -> datetime:
     return min(candidates)
 
 
-def poll_start_time_utc(release_time_berlin: datetime) -> datetime:
+def wake_time_utc(release_time_berlin: datetime) -> datetime:
     """Return UTC wake time: PRE_STRIKE_WAKE_SECONDS before release."""
     return (
         release_time_berlin - timedelta(seconds=PRE_STRIKE_WAKE_SECONDS)
     ).astimezone(UTC_TZ)
+
+
+def measure_server_clock_offset(
+    probe_url: str,
+    budget_s: float = CLOCK_PROBE_BUDGET_S,
+) -> float:
+    """
+    Estimate (server_time - local_time) in seconds by watching the HTTP Date
+    header flip to a new second. The Date header has 1s resolution, but the
+    moment it changes pins the server's second boundary to within roughly one
+    polling interval plus half the round trip.
+
+    Returns 0.0 if no flip is observed within the budget or the measurement
+    fails sanity checks. The strike then fires on local NTP time, exactly as
+    before -- this probe is insurance, not a dependency.
+    """
+    import requests
+    from email.utils import parsedate_to_datetime
+
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT})
+
+    deadline = time.monotonic() + budget_s
+    last_server_epoch: float | None = None
+
+    try:
+        while time.monotonic() < deadline:
+            t0 = time.time()
+            r = s.head(probe_url, timeout=0.8, allow_redirects=False)
+            t1 = time.time()
+
+            date_hdr = r.headers.get("Date")
+            if not date_hdr:
+                log.info("Clock probe: no Date header; skipping adjustment")
+                return 0.0
+
+            server_epoch = parsedate_to_datetime(date_hdr).timestamp()
+
+            if last_server_epoch is not None and server_epoch > last_server_epoch:
+                # The server's second boundary fell between the previous
+                # response and this one. Best estimate of "when the server
+                # clock read server_epoch" is the midpoint of this request.
+                local_mid = t0 + (t1 - t0) / 2.0
+                offset = server_epoch - local_mid
+                rtt_ms = (t1 - t0) * 1000.0
+
+                if abs(offset) > MAX_CLOCK_ADJUST_S:
+                    log.warning(
+                        "Clock probe: offset %.3fs exceeds clamp %.1fs; "
+                        "ignoring (rtt %.0fms)",
+                        offset,
+                        MAX_CLOCK_ADJUST_S,
+                        rtt_ms,
+                    )
+                    return 0.0
+
+                log.info(
+                    "Clock probe: server-local offset %.3fs (rtt %.0fms)",
+                    offset,
+                    rtt_ms,
+                )
+                return offset
+
+            last_server_epoch = server_epoch
+            time.sleep(0.04)
+
+    except Exception as e:
+        log.warning("Clock probe failed (non-fatal): %s", e)
+
+    log.info("Clock probe: no second flip observed in %.1fs; no adjustment", budget_s)
+    return 0.0
 
 
 def sleep_until(target_utc: datetime, label: str, warn_if_more_than_s: int = 600) -> None:
@@ -236,10 +331,12 @@ class TargetBrowser:
     slot: dict
     context: BrowserContext
     page: Page
+    prebuilt: dict | None = None
 
 
 def prewarm_target(browser: Browser, slot: dict, voucher: str) -> TargetBrowser | None:
-    """Spin up a context + page and pre-warm to the redeem step."""
+    """Spin up a context + page, pre-warm to the redeem step, and prebuild
+    the cart-add POST body so the strike can skip the HTML fetch."""
     try:
         ctx = browser.new_context(
             locale="de-DE",
@@ -250,7 +347,15 @@ def prewarm_target(browser: Browser, slot: dict, voucher: str) -> TargetBrowser 
         if not prewarm_to_redeem(page, slot["slot_id"], voucher):
             ctx.close()
             return None
-        return TargetBrowser(slot=slot, context=ctx, page=page)
+
+        sid = str(slot["slot_id"])
+        prebuilt = build_cart_post_body(
+            page,
+            voucher,
+            subevent_id=sid if sid.isdigit() else None,
+            item_id=CART_ITEM_ID,
+        )
+        return TargetBrowser(slot=slot, context=ctx, page=page, prebuilt=prebuilt)
     except Exception as e:
         log.error("prewarm error for %s: %s", slot["slot_id"], e)
         return None
@@ -275,9 +380,23 @@ def direct_booking_attempt(target: TargetBrowser, email: str) -> tuple[dict | No
     try:
         while time.monotonic() < deadline and not cart_was_added:
             attempt += 1
-            log.info("Attempting cart-add for %s attempt %d", sid, attempt)
 
-            if fire_cart_add(target.page, timeout_ms=STRIKE_CART_ADD_TIMEOUT_MS):
+            # First attempts use the prebuilt one-round-trip POST; later
+            # attempts use fetch+parse, which reads the real released form
+            # and self-corrects if the prebuilt body is structurally wrong.
+            use_prebuilt = target.prebuilt if attempt <= PREBUILT_ATTEMPTS else None
+            log.info(
+                "Attempting cart-add for %s attempt %d (%s)",
+                sid,
+                attempt,
+                "prebuilt" if use_prebuilt else "fetch+parse",
+            )
+
+            if fire_cart_add(
+                target.page,
+                timeout_ms=STRIKE_CART_ADD_TIMEOUT_MS,
+                prebuilt=use_prebuilt,
+            ):
                 cart_was_added = True
                 log.info(
                     "Cart added for %s on attempt %d, proceeding to checkout",
@@ -411,15 +530,45 @@ def strike() -> int:
             # resource blocking here; fallback reliability is more valuable than
             # saving subresources on a rare fallback reload.
 
-            # Wake 1 second early so setup is definitely done, but do not fire
-            # until the exact release boundary.
-            wake_utc = poll_start_time_utc(release_time_berlin)
+            # Wake early so setup is definitely done, then use the wake
+            # window for the clock probe and connection warming. Fire at the
+            # release boundary adjusted by the measured server clock offset.
+            wake_utc = wake_time_utc(release_time_berlin)
             release_utc = release_time_berlin.astimezone(UTC_TZ)
             sleep_until(wake_utc, "pre-strike wake time")
+
+            # (1) Pin the server's second boundary so we fire on the server's
+            # 17:00:00, not just our own. Falls back to 0.0 (= local NTP).
+            offset_s = measure_server_clock_offset(BASE_URL)
+            adjusted_release_utc = release_utc - timedelta(seconds=offset_s)
+            if offset_s:
+                log.info(
+                    "Firing at clock-adjusted release: %s (offset %+.3fs)",
+                    adjusted_release_utc.astimezone(BERLIN_TZ).isoformat(
+                        timespec="milliseconds"
+                    ),
+                    offset_s,
+                )
+
+            # (2) Refresh keep-alive connections so the strike POST does not
+            # pay a TLS handshake. Skip if we are running out of window.
+            for t in targets:
+                seconds_left = (
+                    adjusted_release_utc - datetime.now(UTC_TZ)
+                ).total_seconds()
+                if seconds_left < 0.5:
+                    log.warning(
+                        "Skipping remaining connection warming "
+                        "(%.2fs to release)",
+                        seconds_left,
+                    )
+                    break
+                warm_connection(t.page, timeout_ms=600)
+
             sleep_until(
-                release_utc,
-                "release time",
-                warn_if_more_than_s=PRE_STRIKE_WAKE_SECONDS + 5,
+                adjusted_release_utc,
+                "release time (clock-adjusted)",
+                warn_if_more_than_s=int(PRE_STRIKE_WAKE_SECONDS) + 5,
             )
 
             log.info(
