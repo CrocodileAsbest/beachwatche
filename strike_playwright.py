@@ -100,10 +100,10 @@ STRIKE_RETRY_SLEEP_SECONDS = 0.18
 STRIKE_CART_ADD_TIMEOUT_MS = 2500
 
 # Daily booking cap.
-DAILY_BOOKING_LIMIT = 2
+DAILY_BOOKING_LIMIT = 1
 
 # Days the bot does NOT strike on. Wed and Fri reserved for non-bot users.
-EXCLUDED_WEEKDAYS = {"Mi", "Fr"}
+EXCLUDED_WEEKDAYS = {"Mo", "Mi", "Fr"}
 
 # Per-browser User-Agent so Chromium looks like normal Chrome.
 BROWSER_UA = (
